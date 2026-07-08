@@ -1,3 +1,5 @@
+pub mod config;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -51,7 +53,8 @@ pub fn dispatch(cli: Cli) -> String {
         Some(Command::Import { path }) => {
             format!("`seekr import {}` is not implemented yet.", path.display())
         }
-        Some(Command::Stats) => "`seekr stats` is not implemented yet.".to_string(),
+        Some(Command::Stats) => config::stats_report()
+            .unwrap_or_else(|error| format!("Failed to load Seekr config paths: {error}")),
     }
 }
 
@@ -59,7 +62,11 @@ pub fn dispatch(cli: Cli) -> String {
 mod tests {
     use super::{dispatch, Cli, Command};
     use clap::{CommandFactory, Parser};
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_mvp_command_surface() {
@@ -124,17 +131,41 @@ mod tests {
                 },
                 "`seekr import ~/.zsh_history` is not implemented yet.",
             ),
-            (
-                Cli {
-                    command: Some(Command::Stats),
-                },
-                "`seekr stats` is not implemented yet.",
-            ),
         ];
 
         for (cli, expected_message) in cases {
             assert_eq!(dispatch(cli), expected_message);
         }
+    }
+
+    #[test]
+    fn stats_reports_local_paths_and_defaults() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("stats");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Stats),
+        });
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("Seekr paths:"));
+        assert!(output.contains("config dir:"));
+        assert!(output.contains("data dir:"));
+        assert!(output.contains("config file:"));
+        assert!(output.contains("database:"));
+        assert!(output.contains("redaction enabled: false"));
+        assert!(output.contains("noisy command ignore candidates: ls, cd, pwd, clear"));
     }
 
     #[test]
@@ -154,5 +185,24 @@ mod tests {
         assert!(help.contains("failed"));
         assert!(help.contains("import"));
         assert!(help.contains("stats"));
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("seekr-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    fn restore_env(name: &str, value: Option<OsString>) {
+        unsafe {
+            match value {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
     }
 }
