@@ -1,6 +1,6 @@
 # 01 - Bootstrap Rust CLI Crate and Command Surface
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Placeholder command handlers that return clear "not implemented yet" messages and successful build/test results.
 
 **Acceptance Criteria:**
-- [ ] `cargo build` succeeds from the repository root.
-- [ ] `cargo run -- --help` lists the MVP command surface from the PRD.
-- [ ] `cargo run -- search docker` parses `docker` as the search query.
-- [ ] `cargo run -- here`, `cargo run -- failed`, `cargo run -- import ~/.zsh_history`, and `cargo run -- stats` all invoke distinct handlers.
-- [ ] The default `cargo run --` path is reserved for the future TUI and does not perform network access.
-- [ ] Unit or integration tests cover CLI parsing for every MVP command.
+- [x] `cargo build` succeeds from the repository root.
+- [x] `cargo run -- --help` lists the MVP command surface from the PRD.
+- [x] `cargo run -- search docker` parses `docker` as the search query.
+- [x] `cargo run -- here`, `cargo run -- failed`, `cargo run -- import ~/.zsh_history`, and `cargo run -- stats` all invoke distinct handlers.
+- [x] The default `cargo run --` path is reserved for the future TUI and does not perform network access.
+- [x] Unit or integration tests cover CLI parsing for every MVP command.
 
 **Verification Commands:**
 
