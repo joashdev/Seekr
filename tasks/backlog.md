@@ -2,7 +2,7 @@
 
 | Task ID | Title | Type | Depends On | Status | Summary |
 |---|---|---|---|---|---|
-| 01 | Bootstrap Rust CLI crate and command surface | feat | None | [ ] | Create the Rust project skeleton, install the MVP dependencies, and expose the documented `seekr` command surface with safe placeholder behavior. |
+| 01 | Bootstrap Rust CLI crate and command surface | feat | None | [x] | Create the Rust project skeleton, install the MVP dependencies, and expose the documented `seekr` command surface with safe placeholder behavior. |
 | 02 | Add config and local storage foundation | feat | 01 | [ ] | Establish local-only config/data paths, load default config, and expose path inspection through the CLI. |
 | 03 | Create SQLite schema and migration runner | feat | 02 | [ ] | Add the SQLite database schema, FTS5 table, migration runner, and tests proving a fresh database initializes correctly. |
 | 04 | Implement command persistence and capture entrypoint | feat | 03 | [ ] | Persist command records through a store layer and add a CLI capture command suitable for shell hooks. |
