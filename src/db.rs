@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -52,6 +52,74 @@ CREATE INDEX IF NOT EXISTS idx_commands_exit_code ON commands (exit_code);
 INSERT INTO commands_fts(commands_fts) VALUES ('rebuild');
 ";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRecord {
+    pub command_text: String,
+    pub normalized_text: String,
+    pub cwd: String,
+    pub executed_at: i64,
+    pub exit_code: i64,
+    pub shell: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub hostname: Option<String>,
+    pub git_repo: Option<String>,
+    pub git_branch: Option<String>,
+}
+
+impl CommandRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        command_text: String,
+        cwd: String,
+        executed_at: i64,
+        exit_code: i64,
+        shell: Option<String>,
+        duration_ms: Option<i64>,
+        hostname: Option<String>,
+        git_repo: Option<String>,
+        git_branch: Option<String>,
+    ) -> io::Result<Self> {
+        let normalized_text = normalize_command_text(&command_text);
+        if command_text.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command text cannot be empty",
+            ));
+        }
+        if executed_at < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "executed_at cannot be negative",
+            ));
+        }
+        if exit_code < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exit_code cannot be negative",
+            ));
+        }
+        if duration_ms.is_some_and(|duration| duration < 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duration_ms cannot be negative",
+            ));
+        }
+
+        Ok(Self {
+            command_text,
+            normalized_text,
+            cwd,
+            executed_at,
+            exit_code,
+            shell,
+            duration_ms,
+            hostname,
+            git_repo,
+            git_branch,
+        })
+    }
+}
+
 pub fn open(path: &Path) -> io::Result<Connection> {
     ensure_parent_dir(path)?;
 
@@ -91,6 +159,82 @@ pub fn run_migrations(connection: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+pub fn insert_command_record(connection: &Connection, record: &CommandRecord) -> io::Result<i64> {
+    connection
+        .execute(
+            "INSERT INTO commands (
+                command_text,
+                normalized_text,
+                cwd,
+                executed_at,
+                exit_code,
+                shell,
+                duration_ms,
+                hostname,
+                git_repo,
+                git_branch
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &record.command_text,
+                &record.normalized_text,
+                &record.cwd,
+                record.executed_at,
+                record.exit_code,
+                &record.shell,
+                record.duration_ms,
+                &record.hostname,
+                &record.git_repo,
+                &record.git_branch,
+            ],
+        )
+        .map_err(io::Error::other)?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+pub fn recent_command_records(
+    connection: &Connection,
+    limit: usize,
+) -> io::Result<Vec<CommandRecord>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                command_text,
+                normalized_text,
+                cwd,
+                executed_at,
+                exit_code,
+                shell,
+                duration_ms,
+                hostname,
+                git_repo,
+                git_branch
+             FROM commands
+             ORDER BY executed_at DESC, id DESC
+             LIMIT ?1",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map([limit as i64], |row| {
+            Ok(CommandRecord {
+                command_text: row.get(0)?,
+                normalized_text: row.get(1)?,
+                cwd: row.get(2)?,
+                executed_at: row.get(3)?,
+                exit_code: row.get(4)?,
+                shell: row.get(5)?,
+                duration_ms: row.get(6)?,
+                hostname: row.get(7)?,
+                git_repo: row.get(8)?,
+                git_branch: row.get(9)?,
+            })
+        })
+        .map_err(io::Error::other)?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
+}
+
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -99,13 +243,29 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn normalize_command_text(command_text: &str) -> String {
+    command_text
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' | '-' | '_' | '/' | '.' => ch,
+            'A'..='Z' => ch.to_ascii_lowercase(),
+            _ if ch.is_alphanumeric() => ch.to_lowercase().next().unwrap_or(ch),
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::open;
+    use super::{insert_command_record, open, recent_command_records, CommandRecord};
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
     use std::env;
     use std::fs;
+    use std::io;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -201,6 +361,88 @@ mod tests {
             .expect("fts query should succeed");
 
         assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn command_record_insert_and_recent_fetch_preserve_raw_and_normalized_text() {
+        let root = temp_root("db-store");
+        let database_path = root.join("seekr.db");
+        let connection = open(&database_path).expect("database should initialize");
+        let record = CommandRecord::new(
+            "gh pr checkout 123 && cargo   test".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_001,
+            0,
+            Some("zsh".to_string()),
+            Some(250),
+            Some("seekr-host".to_string()),
+            Some("seekr".to_string()),
+            Some("feat/task-04".to_string()),
+        )
+        .expect("record should validate");
+
+        insert_command_record(&connection, &record).expect("insert should succeed");
+
+        let records = recent_command_records(&connection, 5).expect("recent records should load");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].command_text,
+            "gh pr checkout 123 && cargo   test"
+        );
+        assert_eq!(records[0].normalized_text, "gh pr checkout 123 cargo test");
+        assert_eq!(records[0].cwd, "/tmp/project");
+        assert_eq!(records[0].git_branch.as_deref(), Some("feat/task-04"));
+    }
+
+    #[test]
+    fn command_record_rejects_invalid_input() {
+        let empty = CommandRecord::new(
+            "   ".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_001,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("blank command should fail");
+        assert_eq!(empty.kind(), io::ErrorKind::InvalidInput);
+
+        let negative_duration = CommandRecord::new(
+            "cargo test".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_001,
+            0,
+            None,
+            Some(-1),
+            None,
+            None,
+            None,
+        )
+        .expect_err("negative duration should fail");
+        assert_eq!(negative_duration.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn punctuation_only_commands_are_still_valid_raw_commands() {
+        let record = CommandRecord::new(
+            ":".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_001,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("shell builtins should still persist");
+
+        assert_eq!(record.command_text, ":");
+        assert!(record.normalized_text.is_empty());
     }
 
     fn names_for(connection: &Connection, object_type: &str) -> HashSet<String> {
