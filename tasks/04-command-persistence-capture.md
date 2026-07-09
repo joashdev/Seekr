@@ -1,6 +1,6 @@
 # 04 - Implement Command Persistence and Capture Entrypoint
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Tests for successful capture, rejected capture, and persisted metadata.
 
 **Acceptance Criteria:**
-- [ ] A valid capture invocation writes exactly one command record to SQLite.
-- [ ] Empty commands are ignored or rejected without creating records.
-- [ ] Raw command text is preserved exactly for later display/execution.
-- [ ] Normalized command text is populated for search.
-- [ ] Capture can run with temp config/data directories in tests.
-- [ ] Existing CLI, config, and database tests continue to pass.
+- [x] A valid capture invocation writes exactly one command record to SQLite.
+- [x] Empty commands are ignored or rejected without creating records.
+- [x] Raw command text is preserved exactly for later display/execution.
+- [x] Normalized command text is populated for search.
+- [x] Capture can run with temp config/data directories in tests.
+- [x] Existing CLI, config, and database tests continue to pass.
 
 **Verification Commands:**
 
