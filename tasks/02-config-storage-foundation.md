@@ -1,6 +1,6 @@
 # 02 - Add Config and Local Storage Foundation
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - A CLI-accessible way to inspect resolved paths, such as a `seekr stats` placeholder section or an internal command hidden from normal help.
 
 **Acceptance Criteria:**
-- [ ] Config and data paths are resolved without network access.
-- [ ] Missing config files fall back to defaults.
-- [ ] Test overrides can isolate all filesystem writes under a temp directory.
-- [ ] Default noisy command ignore candidates include `ls`, `cd`, `pwd`, and `clear` but are only applied by later ingestion tasks.
-- [ ] Tests cover default config loading, environment overrides, and config file parsing.
-- [ ] Existing CLI parsing tests from task 01 still pass.
+- [x] Config and data paths are resolved without network access.
+- [x] Missing config files fall back to defaults.
+- [x] Test overrides can isolate all filesystem writes under a temp directory.
+- [x] Default noisy command ignore candidates include `ls`, `cd`, `pwd`, and `clear` but are only applied by later ingestion tasks.
+- [x] Tests cover default config loading, environment overrides, and config file parsing.
+- [x] Existing CLI parsing tests from task 01 still pass.
 
 **Verification Commands:**
 
