@@ -1,4 +1,5 @@
 pub mod config;
+pub mod db;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -166,6 +167,8 @@ mod tests {
         assert!(output.contains("database:"));
         assert!(output.contains("redaction enabled: false"));
         assert!(output.contains("noisy command ignore candidates: ls, cd, pwd, clear"));
+        assert!(data_dir.is_dir());
+        assert!(data_dir.join("seekr.db").is_file());
     }
 
     #[test]
