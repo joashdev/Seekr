@@ -1,3 +1,4 @@
+use crate::db;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -92,6 +93,7 @@ pub fn write_default_if_missing(paths: &ResolvedPaths) -> io::Result<()> {
 pub fn stats_report() -> io::Result<String> {
     let paths = ResolvedPaths::from_env()?;
     let config = load(&paths)?;
+    let _database = db::open(&paths.database_file())?;
 
     Ok(format!(
         "Seekr paths:\n  config dir: {}\n  data dir: {}\n  config file: {}\n  database: {}\n\nConfig defaults:\n  redaction enabled: {}\n  noisy command ignore candidates: {}\n  shell preference slots: {}",

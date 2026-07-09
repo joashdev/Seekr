@@ -1,6 +1,6 @@
 # 03 - Create SQLite Schema and Migration Runner
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Tests that initialize a fresh database and verify the expected tables, indexes, and FTS5 support.
 
 **Acceptance Criteria:**
-- [ ] Opening the database path from task 02 creates parent directories when needed.
-- [ ] Running migrations multiple times is safe and idempotent.
-- [ ] The schema stores raw command text separately from normalized text used for search.
-- [ ] FTS5 insertion and query can run in a test database.
-- [ ] Metadata indexes exist for cwd, repo, branch, timestamp, and exit code filtering.
-- [ ] No network access or external services are required.
+- [x] Opening the database path from task 02 creates parent directories when needed.
+- [x] Running migrations multiple times is safe and idempotent.
+- [x] The schema stores raw command text separately from normalized text used for search.
+- [x] FTS5 insertion and query can run in a test database.
+- [x] Metadata indexes exist for cwd, repo, branch, timestamp, and exit code filtering.
+- [x] No network access or external services are required.
 
 **Verification Commands:**
 
