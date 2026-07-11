@@ -2,8 +2,10 @@ pub mod config;
 pub mod db;
 
 use clap::{Args, Parser, Subcommand};
+use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLI_ABOUT: &str =
     "Seekr is a local-first CLI and future TUI for recalling terminal commands.";
@@ -87,10 +89,7 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
         Some(Command::Search(args)) => search(args),
         Some(Command::Here) => Ok("`seekr here` is not implemented yet.".to_string()),
         Some(Command::Failed) => Ok("`seekr failed` is not implemented yet.".to_string()),
-        Some(Command::Import { path }) => Ok(format!(
-            "`seekr import {}` is not implemented yet.",
-            path.display()
-        )),
+        Some(Command::Import { path }) => import(path),
         Some(Command::Capture(args)) => capture(args),
         Some(Command::Stats) => config::stats_report(),
     }
@@ -142,9 +141,154 @@ fn capture(args: CaptureArgs) -> io::Result<String> {
     Ok(String::new())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    command_text: String,
+    executed_at: i64,
+    duration_ms: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedHistoryEntry {
+    Entry(HistoryEntry),
+    Skipped,
+    Failed,
+}
+
+fn import(path: PathBuf) -> io::Result<String> {
+    let history = fs::read(path)?;
+    let fallback_timestamp = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .map_err(io::Error::other)?;
+    let cwd = std::env::current_dir()?.display().to_string();
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    let mut inserted = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    for entry in parse_zsh_history(&history, fallback_timestamp) {
+        let ParsedHistoryEntry::Entry(entry) = entry else {
+            if matches!(entry, ParsedHistoryEntry::Skipped) {
+                skipped += 1;
+            } else {
+                failed += 1;
+            }
+            continue;
+        };
+
+        if entry.command_text.trim().is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        let record = match db::CommandRecord::new(
+            entry.command_text,
+            cwd.clone(),
+            entry.executed_at,
+            0,
+            Some("zsh".to_string()),
+            entry.duration_ms,
+            None,
+            None,
+            None,
+        ) {
+            Ok(record) => record,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        if db::insert_command_record(&connection, &record).is_ok() {
+            inserted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    Ok(format!(
+        "Import complete: inserted: {inserted}, skipped: {skipped}, failed: {failed}."
+    ))
+}
+
+fn parse_zsh_history(history: &[u8], fallback_timestamp: i64) -> Vec<ParsedHistoryEntry> {
+    let mut entries = Vec::new();
+
+    for line in history.split_inclusive(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Ok(line) = std::str::from_utf8(line) else {
+            entries.push(ParsedHistoryEntry::Failed);
+            continue;
+        };
+
+        if let Some(ParsedHistoryEntry::Entry(entry)) = entries.last_mut() {
+            if entry.command_text.ends_with('\\') {
+                entry.command_text.push('\n');
+                entry.command_text.push_str(line);
+                continue;
+            }
+        }
+
+        if line.trim().is_empty() {
+            entries.push(ParsedHistoryEntry::Skipped);
+        } else if let Some(metadata) = line.strip_prefix(": ").filter(|metadata| {
+            metadata
+                .split_once(';')
+                .is_some_and(|(metadata, _)| metadata.contains(':'))
+        }) {
+            entries.push(parse_extended_history_entry(metadata));
+        } else {
+            entries.push(ParsedHistoryEntry::Entry(HistoryEntry {
+                command_text: line.to_string(),
+                executed_at: fallback_timestamp,
+                duration_ms: None,
+            }));
+        }
+    }
+
+    entries
+}
+
+fn parse_extended_history_entry(metadata: &str) -> ParsedHistoryEntry {
+    let Some((metadata, command_text)) = metadata.split_once(';') else {
+        return ParsedHistoryEntry::Failed;
+    };
+    let Some((timestamp, duration)) = metadata.split_once(':') else {
+        return ParsedHistoryEntry::Failed;
+    };
+    let (Ok(executed_at), Some(duration_ms)) = (
+        timestamp.parse::<i64>(),
+        duration
+            .parse::<i64>()
+            .ok()
+            .filter(|duration| *duration >= 0)
+            .and_then(|duration| duration.checked_mul(1_000)),
+    ) else {
+        return ParsedHistoryEntry::Failed;
+    };
+    if executed_at < 0 {
+        return ParsedHistoryEntry::Failed;
+    }
+
+    ParsedHistoryEntry::Entry(HistoryEntry {
+        command_text: command_text.to_string(),
+        executed_at,
+        duration_ms: Some(duration_ms),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, CaptureArgs, Cli, Command, SearchArgs};
+    use super::{
+        dispatch, parse_zsh_history, CaptureArgs, Cli, Command, HistoryEntry, ParsedHistoryEntry,
+        SearchArgs,
+    };
     use clap::{CommandFactory, Parser};
     use std::env;
     use std::ffi::OsString;
@@ -232,14 +376,6 @@ mod tests {
                     command: Some(Command::Failed),
                 },
                 "`seekr failed` is not implemented yet.",
-            ),
-            (
-                Cli {
-                    command: Some(Command::Import {
-                        path: PathBuf::from("~/.zsh_history"),
-                    }),
-                },
-                "`seekr import ~/.zsh_history` is not implemented yet.",
             ),
         ];
 
@@ -463,6 +599,148 @@ mod tests {
         restore_env("SEEKR_DATA_DIR", original_data_dir);
 
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn parses_zsh_history_fixture_formats() {
+        let entries = parse_zsh_history(
+            include_bytes!("../tests/fixtures/zsh_history.sample"),
+            1_700_000_003,
+        );
+
+        assert_eq!(
+            entries,
+            vec![
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "git status".to_string(),
+                    executed_at: 1_700_000_000,
+                    duration_ms: Some(0),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "cargo test".to_string(),
+                    executed_at: 1_700_000_001,
+                    duration_ms: Some(2_000),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "plain history command".to_string(),
+                    executed_at: 1_700_000_003,
+                    duration_ms: None,
+                }),
+                ParsedHistoryEntry::Skipped,
+                ParsedHistoryEntry::Failed,
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "printf 'first \\\nsecond'".to_string(),
+                    executed_at: 1_700_000_002,
+                    duration_ms: Some(1_000),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "printf 'metadata-looking \\\n: continuation'".to_string(),
+                    executed_at: 1_700_000_005,
+                    duration_ms: Some(0),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: ": plain colon command".to_string(),
+                    executed_at: 1_700_000_003,
+                    duration_ms: None,
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: String::new(),
+                    executed_at: 1_700_000_004,
+                    duration_ms: Some(0),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_persists_fixture_records_and_reports_counts() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("import");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Import {
+                path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/zsh_history.sample"),
+            }),
+        })
+        .expect("history import should succeed");
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 10).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(
+            output,
+            "Import complete: inserted: 6, skipped: 2, failed: 1."
+        );
+        assert_eq!(records.len(), 6);
+        assert!(records.iter().any(|record| {
+            record.command_text == "git status"
+                && record.executed_at == 1_700_000_000
+                && record.duration_ms == Some(0)
+                && record.shell.as_deref() == Some("zsh")
+        }));
+        assert!(records.iter().any(|record| {
+            record.command_text == "plain history command" && record.duration_ms.is_none()
+        }));
+        assert!(records
+            .iter()
+            .any(|record| record.command_text == "printf 'first \\\nsecond'"));
+        assert!(records.iter().any(|record| {
+            record.command_text == "printf 'metadata-looking \\\n: continuation'"
+        }));
+        assert!(records
+            .iter()
+            .any(|record| record.command_text == ": plain colon command"));
+    }
+
+    #[test]
+    fn import_counts_invalid_utf8_line_as_failed() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("import-invalid-utf8");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let history_file = root.join(".zsh_history");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        fs::write(
+            &history_file,
+            b"git status\ninvalid \xff line\ncargo test\n",
+        )
+        .expect("history fixture should write");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Import { path: history_file }),
+        })
+        .expect("valid history lines should still import");
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 10).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(
+            output,
+            "Import complete: inserted: 2, skipped: 0, failed: 1."
+        );
+        assert_eq!(records.len(), 2);
     }
 
     #[test]
