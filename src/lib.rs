@@ -26,10 +26,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Search for previously captured commands.
-    Search {
-        /// Free-text query to look up.
-        query: String,
-    },
+    Search(SearchArgs),
     /// Limit results to the current directory or repository context.
     Here,
     /// Limit results to failed commands.
@@ -43,6 +40,20 @@ pub enum Command {
     Capture(CaptureArgs),
     /// Show local usage and index health statistics.
     Stats,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct SearchArgs {
+    /// Free-text query to look up.
+    pub query: String,
+    /// Maximum number of matching commands to show.
+    #[arg(
+        short,
+        long,
+        default_value_t = 10,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=100)
+    )]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -73,9 +84,7 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
             "Seekr TUI is not implemented yet. Network access remains disabled on this path."
                 .to_string(),
         ),
-        Some(Command::Search { query }) => {
-            Ok(format!("`seekr search {query}` is not implemented yet."))
-        }
+        Some(Command::Search(args)) => search(args),
         Some(Command::Here) => Ok("`seekr here` is not implemented yet.".to_string()),
         Some(Command::Failed) => Ok("`seekr failed` is not implemented yet.".to_string()),
         Some(Command::Import { path }) => Ok(format!(
@@ -85,6 +94,34 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
         Some(Command::Capture(args)) => capture(args),
         Some(Command::Stats) => config::stats_report(),
     }
+}
+
+fn search(args: SearchArgs) -> io::Result<String> {
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    let records = db::search_command_records(&connection, &args.query, args.limit)?;
+
+    if records.is_empty() {
+        return Ok(format!("No local commands found for {:?}.", args.query));
+    }
+
+    Ok(records
+        .iter()
+        .map(|record| {
+            let mut metadata = format!(
+                "  cwd: {} | timestamp: {} | exit: {}",
+                record.cwd, record.executed_at, record.exit_code
+            );
+            if let Some(repo) = &record.git_repo {
+                metadata.push_str(&format!(" | repo: {repo}"));
+            }
+            if let Some(branch) = &record.git_branch {
+                metadata.push_str(&format!(" | branch: {branch}"));
+            }
+            format!("{}\n{metadata}", record.command_text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
 }
 
 fn capture(args: CaptureArgs) -> io::Result<String> {
@@ -107,7 +144,7 @@ fn capture(args: CaptureArgs) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, CaptureArgs, Cli, Command};
+    use super::{dispatch, CaptureArgs, Cli, Command, SearchArgs};
     use clap::{CommandFactory, Parser};
     use std::env;
     use std::ffi::OsString;
@@ -122,9 +159,17 @@ mod tests {
             (vec!["seekr"], None),
             (
                 vec!["seekr", "search", "docker"],
-                Some(Command::Search {
+                Some(Command::Search(SearchArgs {
                     query: "docker".to_string(),
-                }),
+                    limit: 10,
+                })),
+            ),
+            (
+                vec!["seekr", "search", "docker", "--limit", "2"],
+                Some(Command::Search(SearchArgs {
+                    query: "docker".to_string(),
+                    limit: 2,
+                })),
             ),
             (vec!["seekr", "here"], Some(Command::Here)),
             (vec!["seekr", "failed"], Some(Command::Failed)),
@@ -178,14 +223,6 @@ mod tests {
             ),
             (
                 Cli {
-                    command: Some(Command::Search {
-                        query: "docker".to_string(),
-                    }),
-                },
-                "`seekr search docker` is not implemented yet.",
-            ),
-            (
-                Cli {
                     command: Some(Command::Here),
                 },
                 "`seekr here` is not implemented yet.",
@@ -212,6 +249,34 @@ mod tests {
                 expected_message
             );
         }
+    }
+
+    #[test]
+    fn empty_search_reports_local_only_message() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search-empty");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "docker".to_string(),
+                limit: 10,
+            })),
+        })
+        .expect("empty search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(output, "No local commands found for \"docker\".");
     }
 
     #[test]
@@ -303,6 +368,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_search_limits_are_rejected_by_cli_parser() {
+        for limit in ["0", "101", "18446744073709551615"] {
+            let error = Cli::try_parse_from(["seekr", "search", "docker", "--limit", limit])
+                .expect_err("invalid search limit should fail");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
     fn capture_persists_command_metadata() {
         let _guard = crate::config::env_lock().lock().expect("env lock");
         let root = temp_root("capture");
@@ -389,6 +463,54 @@ mod tests {
         restore_env("SEEKR_DATA_DIR", original_data_dir);
 
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn search_outputs_raw_command_and_metadata() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let record = crate::db::CommandRecord::new(
+            "docker compose up && cargo test".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_000,
+            0,
+            None,
+            None,
+            None,
+            Some("seekr".to_string()),
+            Some("main".to_string()),
+        )
+        .expect("record should validate");
+        crate::db::insert_command_record(&connection, &record).expect("record should insert");
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "docker".to_string(),
+                limit: 10,
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("docker compose up && cargo test"));
+        assert!(output.contains("cwd: /tmp/project"));
+        assert!(output.contains("timestamp: 1720000000"));
+        assert!(output.contains("exit: 0"));
+        assert!(output.contains("repo: seekr"));
+        assert!(output.contains("branch: main"));
     }
 
     fn temp_root(label: &str) -> PathBuf {

@@ -1,6 +1,6 @@
 # 05 - Implement FTS-Backed CLI Search
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -16,12 +16,12 @@
 - Tests covering indexing, searching, empty-result behavior, and result ordering.
 
 **Acceptance Criteria:**
-- [ ] Captured commands are searchable by keyword through `seekr search`.
-- [ ] Search returns raw command text, not normalized-only text.
-- [ ] Empty results print a clear local-only message and exit successfully.
-- [ ] Search result limits prevent unbounded output.
-- [ ] Tests prove FTS matches inserted command records.
-- [ ] No TUI code is required for this task.
+- [x] Captured commands are searchable by keyword through `seekr search`.
+- [x] Search returns raw command text, not normalized-only text.
+- [x] Empty results print a clear local-only message and exit successfully.
+- [x] Search result limits prevent unbounded output.
+- [x] Tests prove FTS matches inserted command records.
+- [x] No TUI code is required for this task.
 
 **Verification Commands:**
 

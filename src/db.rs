@@ -235,6 +235,70 @@ pub fn recent_command_records(
         .map_err(io::Error::other)
 }
 
+pub fn search_command_records(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+) -> io::Result<Vec<CommandRecord>> {
+    let limit = i64::try_from(limit)
+        .ok()
+        .filter(|limit| (1..=100).contains(limit))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "limit must be between 1 and 100",
+            )
+        })?;
+    let query = normalize_command_text(query)
+        .split_whitespace()
+        .map(|term| format!("\"{term}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                commands.command_text,
+                commands.normalized_text,
+                commands.cwd,
+                commands.executed_at,
+                commands.exit_code,
+                commands.shell,
+                commands.duration_ms,
+                commands.hostname,
+                commands.git_repo,
+                commands.git_branch
+             FROM commands_fts
+             JOIN commands ON commands.id = commands_fts.rowid
+             WHERE commands_fts MATCH ?1
+             ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC
+             LIMIT ?2",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(params![query, limit], |row| {
+            Ok(CommandRecord {
+                command_text: row.get(0)?,
+                normalized_text: row.get(1)?,
+                cwd: row.get(2)?,
+                executed_at: row.get(3)?,
+                exit_code: row.get(4)?,
+                shell: row.get(5)?,
+                duration_ms: row.get(6)?,
+                hostname: row.get(7)?,
+                git_repo: row.get(8)?,
+                git_branch: row.get(9)?,
+            })
+        })
+        .map_err(io::Error::other)?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
+}
+
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -260,7 +324,9 @@ fn normalize_command_text(command_text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_command_record, open, recent_command_records, CommandRecord};
+    use super::{
+        insert_command_record, open, recent_command_records, search_command_records, CommandRecord,
+    };
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
     use std::env;
@@ -393,6 +459,86 @@ mod tests {
         assert_eq!(records[0].normalized_text, "gh pr checkout 123 cargo test");
         assert_eq!(records[0].cwd, "/tmp/project");
         assert_eq!(records[0].git_branch.as_deref(), Some("feat/task-04"));
+    }
+
+    #[test]
+    fn fts_search_returns_raw_commands_in_ranked_recency_order() {
+        let root = temp_root("db-search");
+        let database_path = root.join("seekr.db");
+        let connection = open(&database_path).expect("database should initialize");
+
+        for (command_text, executed_at) in [
+            ("docker compose up", 1_720_000_000),
+            ("docker compose up", 1_720_000_001),
+            ("cargo test", 1_720_000_002),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let records =
+            search_command_records(&connection, "docker", 1).expect("search should succeed");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command_text, "docker compose up");
+        assert_eq!(records[0].executed_at, 1_720_000_001);
+
+        let records =
+            search_command_records(&connection, "docker", 5).expect("search should succeed");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].executed_at, 1_720_000_001);
+        assert_eq!(records[1].executed_at, 1_720_000_000);
+    }
+
+    #[test]
+    fn fts_search_handles_command_punctuation() {
+        let root = temp_root("db-search-punctuation");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for command_text in ["git-status", "foo/bar", "foo.bar", "git status --short"] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                1_720_000_000,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+
+            let records = search_command_records(&connection, command_text, 10)
+                .expect("punctuated search should succeed");
+            assert!(records
+                .iter()
+                .any(|record| record.command_text == command_text));
+        }
+    }
+
+    #[test]
+    fn fts_search_rejects_invalid_limits() {
+        let root = temp_root("db-search-limit");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for limit in [0, usize::MAX] {
+            let error = search_command_records(&connection, "docker", limit)
+                .expect_err("invalid limit should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
