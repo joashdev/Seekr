@@ -1,7 +1,8 @@
 pub mod config;
 pub mod db;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use std::io;
 use std::path::PathBuf;
 
 const CLI_ABOUT: &str =
@@ -25,10 +26,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Search for previously captured commands.
-    Search {
-        /// Free-text query to look up.
-        query: String,
-    },
+    Search(SearchArgs),
     /// Limit results to the current directory or repository context.
     Here,
     /// Limit results to failed commands.
@@ -38,34 +36,120 @@ pub enum Command {
         /// Path to a shell history file, such as ~/.zsh_history.
         path: PathBuf,
     },
+    #[command(hide = true)]
+    Capture(CaptureArgs),
     /// Show local usage and index health statistics.
     Stats,
 }
 
-pub fn dispatch(cli: Cli) -> String {
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct SearchArgs {
+    /// Free-text query to look up.
+    pub query: String,
+    /// Maximum number of matching commands to show.
+    #[arg(
+        short,
+        long,
+        default_value_t = 10,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=100)
+    )]
+    pub limit: usize,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct CaptureArgs {
+    #[arg(long = "command-text")]
+    pub command_text: String,
+    #[arg(long)]
+    pub cwd: String,
+    #[arg(long = "executed-at")]
+    pub executed_at: i64,
+    #[arg(long = "exit-code")]
+    pub exit_code: i64,
+    #[arg(long)]
+    pub shell: Option<String>,
+    #[arg(long = "duration-ms")]
+    pub duration_ms: Option<i64>,
+    #[arg(long)]
+    pub hostname: Option<String>,
+    #[arg(long = "git-repo")]
+    pub git_repo: Option<String>,
+    #[arg(long = "git-branch")]
+    pub git_branch: Option<String>,
+}
+
+pub fn dispatch(cli: Cli) -> io::Result<String> {
     match cli.command {
-        None => "Seekr TUI is not implemented yet. Network access remains disabled on this path."
-            .to_string(),
-        Some(Command::Search { query }) => {
-            format!("`seekr search {query}` is not implemented yet.")
-        }
-        Some(Command::Here) => "`seekr here` is not implemented yet.".to_string(),
-        Some(Command::Failed) => "`seekr failed` is not implemented yet.".to_string(),
-        Some(Command::Import { path }) => {
-            format!("`seekr import {}` is not implemented yet.", path.display())
-        }
-        Some(Command::Stats) => config::stats_report()
-            .unwrap_or_else(|error| format!("Failed to load Seekr config paths: {error}")),
+        None => Ok(
+            "Seekr TUI is not implemented yet. Network access remains disabled on this path."
+                .to_string(),
+        ),
+        Some(Command::Search(args)) => search(args),
+        Some(Command::Here) => Ok("`seekr here` is not implemented yet.".to_string()),
+        Some(Command::Failed) => Ok("`seekr failed` is not implemented yet.".to_string()),
+        Some(Command::Import { path }) => Ok(format!(
+            "`seekr import {}` is not implemented yet.",
+            path.display()
+        )),
+        Some(Command::Capture(args)) => capture(args),
+        Some(Command::Stats) => config::stats_report(),
     }
+}
+
+fn search(args: SearchArgs) -> io::Result<String> {
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    let records = db::search_command_records(&connection, &args.query, args.limit)?;
+
+    if records.is_empty() {
+        return Ok(format!("No local commands found for {:?}.", args.query));
+    }
+
+    Ok(records
+        .iter()
+        .map(|record| {
+            let mut metadata = format!(
+                "  cwd: {} | timestamp: {} | exit: {}",
+                record.cwd, record.executed_at, record.exit_code
+            );
+            if let Some(repo) = &record.git_repo {
+                metadata.push_str(&format!(" | repo: {repo}"));
+            }
+            if let Some(branch) = &record.git_branch {
+                metadata.push_str(&format!(" | branch: {branch}"));
+            }
+            format!("{}\n{metadata}", record.command_text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn capture(args: CaptureArgs) -> io::Result<String> {
+    let record = db::CommandRecord::new(
+        args.command_text,
+        args.cwd,
+        args.executed_at,
+        args.exit_code,
+        args.shell,
+        args.duration_ms,
+        args.hostname,
+        args.git_repo,
+        args.git_branch,
+    )?;
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    db::insert_command_record(&connection, &record)?;
+    Ok(String::new())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, Cli, Command};
+    use super::{dispatch, CaptureArgs, Cli, Command, SearchArgs};
     use clap::{CommandFactory, Parser};
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::io;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,9 +159,17 @@ mod tests {
             (vec!["seekr"], None),
             (
                 vec!["seekr", "search", "docker"],
-                Some(Command::Search {
+                Some(Command::Search(SearchArgs {
                     query: "docker".to_string(),
-                }),
+                    limit: 10,
+                })),
+            ),
+            (
+                vec!["seekr", "search", "docker", "--limit", "2"],
+                Some(Command::Search(SearchArgs {
+                    query: "docker".to_string(),
+                    limit: 2,
+                })),
             ),
             (vec!["seekr", "here"], Some(Command::Here)),
             (vec!["seekr", "failed"], Some(Command::Failed)),
@@ -86,6 +178,31 @@ mod tests {
                 Some(Command::Import {
                     path: PathBuf::from("~/.zsh_history"),
                 }),
+            ),
+            (
+                vec![
+                    "seekr",
+                    "capture",
+                    "--command-text",
+                    "cargo test",
+                    "--cwd",
+                    "/tmp/project",
+                    "--executed-at",
+                    "1720000000",
+                    "--exit-code",
+                    "0",
+                ],
+                Some(Command::Capture(CaptureArgs {
+                    command_text: "cargo test".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                    executed_at: 1_720_000_000,
+                    exit_code: 0,
+                    shell: None,
+                    duration_ms: None,
+                    hostname: None,
+                    git_repo: None,
+                    git_branch: None,
+                })),
             ),
             (vec!["seekr", "stats"], Some(Command::Stats)),
         ];
@@ -103,14 +220,6 @@ mod tests {
             (
                 Cli { command: None },
                 "Seekr TUI is not implemented yet. Network access remains disabled on this path.",
-            ),
-            (
-                Cli {
-                    command: Some(Command::Search {
-                        query: "docker".to_string(),
-                    }),
-                },
-                "`seekr search docker` is not implemented yet.",
             ),
             (
                 Cli {
@@ -135,8 +244,39 @@ mod tests {
         ];
 
         for (cli, expected_message) in cases {
-            assert_eq!(dispatch(cli), expected_message);
+            assert_eq!(
+                dispatch(cli).expect("placeholder command should dispatch"),
+                expected_message
+            );
         }
+    }
+
+    #[test]
+    fn empty_search_reports_local_only_message() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search-empty");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "docker".to_string(),
+                limit: 10,
+            })),
+        })
+        .expect("empty search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(output, "No local commands found for \"docker\".");
     }
 
     #[test]
@@ -155,7 +295,8 @@ mod tests {
 
         let output = dispatch(Cli {
             command: Some(Command::Stats),
-        });
+        })
+        .expect("stats should render");
 
         restore_env("SEEKR_CONFIG_DIR", original_config_dir);
         restore_env("SEEKR_DATA_DIR", original_data_dir);
@@ -188,6 +329,188 @@ mod tests {
         assert!(help.contains("failed"));
         assert!(help.contains("import"));
         assert!(help.contains("stats"));
+        assert!(!help
+            .lines()
+            .any(|line| line.trim_start().starts_with("capture")));
+    }
+
+    #[test]
+    fn malformed_capture_numbers_are_rejected_by_cli_parser() {
+        let error = Cli::try_parse_from([
+            "seekr",
+            "capture",
+            "--command-text",
+            "cargo test",
+            "--cwd",
+            "/tmp/project",
+            "--executed-at",
+            "not-a-timestamp",
+            "--exit-code",
+            "0",
+        ])
+        .expect_err("invalid timestamp should fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+
+        let error = Cli::try_parse_from([
+            "seekr",
+            "capture",
+            "--command-text",
+            "cargo test",
+            "--cwd",
+            "/tmp/project",
+            "--executed-at",
+            "1720000000",
+            "--exit-code",
+            "not-an-exit-code",
+        ])
+        .expect_err("invalid exit code should fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn invalid_search_limits_are_rejected_by_cli_parser() {
+        for limit in ["0", "101", "18446744073709551615"] {
+            let error = Cli::try_parse_from(["seekr", "search", "docker", "--limit", limit])
+                .expect_err("invalid search limit should fail");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn capture_persists_command_metadata() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "gh pr checkout 123 && cargo   test".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: Some("zsh".to_string()),
+                duration_ms: Some(250),
+                hostname: Some("seekr-host".to_string()),
+                git_repo: Some("seekr".to_string()),
+                git_branch: Some("feat/task-04".to_string()),
+            })),
+        })
+        .expect("capture should succeed");
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 5).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].command_text,
+            "gh pr checkout 123 && cargo   test"
+        );
+        assert_eq!(records[0].normalized_text, "gh pr checkout 123 cargo test");
+        assert_eq!(records[0].shell.as_deref(), Some("zsh"));
+        assert_eq!(records[0].duration_ms, Some(250));
+        assert_eq!(records[0].git_repo.as_deref(), Some("seekr"));
+        assert_eq!(records[0].git_branch.as_deref(), Some("feat/task-04"));
+    }
+
+    #[test]
+    fn empty_capture_command_is_rejected_without_persisting() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture-empty");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let error = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "   ".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect_err("blank capture should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 5).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn search_outputs_raw_command_and_metadata() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let record = crate::db::CommandRecord::new(
+            "docker compose up && cargo test".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_000,
+            0,
+            None,
+            None,
+            None,
+            Some("seekr".to_string()),
+            Some("main".to_string()),
+        )
+        .expect("record should validate");
+        crate::db::insert_command_record(&connection, &record).expect("record should insert");
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "docker".to_string(),
+                limit: 10,
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("docker compose up && cargo test"));
+        assert!(output.contains("cwd: /tmp/project"));
+        assert!(output.contains("timestamp: 1720000000"));
+        assert!(output.contains("exit: 0"));
+        assert!(output.contains("repo: seekr"));
+        assert!(output.contains("branch: main"));
     }
 
     fn temp_root(label: &str) -> PathBuf {
