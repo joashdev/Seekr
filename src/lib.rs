@@ -265,6 +265,7 @@ _seekr_precmd() {
   local -a args
 
   trap - DEBUG
+  finished_at_ms=$(_seekr_now_ms)
   if [[ -n $SEEKR_PROMPT_COMMAND ]]; then
     (exit "$exit_code")
     eval "$SEEKR_PROMPT_COMMAND"
@@ -275,7 +276,6 @@ _seekr_precmd() {
     if [[ $history_line != "$SEEKR_LAST_HISTORY" && $history_line =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
       SEEKR_COMMAND=${BASH_REMATCH[2]}
     fi
-    finished_at_ms=$(_seekr_now_ms)
     duration_ms=$(( finished_at_ms - SEEKR_STARTED_AT_MS ))
     args=(
       --command-text "$SEEKR_COMMAND"
@@ -591,7 +591,7 @@ mod tests {
     use std::fs;
     use std::io::{self, Write};
     use std::path::PathBuf;
-    use std::process::{Command as ProcessCommand, Stdio};
+    use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
