@@ -1,6 +1,6 @@
 # 13 - Implement Stats Command and Local Health Reporting
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -15,12 +15,12 @@
 - Tests for stats calculations against a temp database.
 
 **Acceptance Criteria:**
-- [ ] `seekr stats` prints useful local-only health information.
-- [ ] Stats include total command count and indexed command count.
-- [ ] Stats include duplicate/collapsed group information after task 10.
-- [ ] Stats include failed command count and history time range when data exists.
-- [ ] Stats report redaction enabled/disabled without printing secret values.
-- [ ] Missing or empty databases are handled gracefully.
+- [x] `seekr stats` prints useful local-only health information.
+- [x] Stats include total command count and indexed command count.
+- [x] Stats include duplicate/collapsed group information after task 10.
+- [x] Stats include failed command count and history time range when data exists.
+- [x] Stats report redaction enabled/disabled without printing secret values.
+- [x] Missing or empty databases are handled gracefully.
 
 **Verification Commands:**
 
