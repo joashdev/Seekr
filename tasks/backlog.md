@@ -7,7 +7,7 @@
 | 03 | Create SQLite schema and migration runner | feat | 02 | [x] | Add the SQLite database schema, FTS5 table, migration runner, and tests proving a fresh database initializes correctly. |
 | 04 | Implement command persistence and capture entrypoint | feat | 03 | [x] | Persist command records through a store layer and add a CLI capture command suitable for shell hooks. |
 | 05 | Implement FTS-backed CLI search | feat | 04 | [x] | Make `seekr search <query>` return ranked command results from SQLite FTS with useful metadata. |
-| 06 | Import `.zsh_history` files | feat | 04 | [ ] | Parse zsh history formats, import commands into SQLite, and report import counts without requiring shell hooks. |
+| 06 | Import `.zsh_history` files | feat | 04 | [x] | Parse zsh history formats, import commands into SQLite, and report import counts without requiring shell hooks. |
 | 07 | Add contextual filters and first-class shortcuts | feat | 05 | [x] | Support `here`, `failed`, and metadata filters for cwd, repo, branch, exit status, and time windows. |
 | 08 | Add shell hook generation for zsh and bash | feat | 04 | [ ] | Generate shell setup snippets that capture commands, cwd, timestamp, exit code, shell, duration, hostname, git repo, and branch. |
 | 09 | Add privacy controls, ignore rules, and redaction | feat | 04, 06, 08 | [ ] | Apply configurable ignore patterns, noisy command suppression, and optional redaction to capture and import paths. |
