@@ -1,6 +1,6 @@
 # 06 - Import `.zsh_history` Files
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Tests with fixture content covering extended history, plain history, multiline commands when feasible, and malformed lines.
 
 **Acceptance Criteria:**
-- [ ] `seekr import <path>` imports valid zsh history records into SQLite.
-- [ ] Extended zsh timestamps and durations are preserved when present.
-- [ ] Plain history lines import with reasonable fallback metadata.
-- [ ] Malformed lines do not abort the entire import.
-- [ ] Import output reports inserted, skipped, and failed counts.
-- [ ] The implementation leaves room for `.bash_history` import later without adding bash support in this task.
+- [x] `seekr import <path>` imports valid zsh history records into SQLite.
+- [x] Extended zsh timestamps and durations are preserved when present.
+- [x] Plain history lines import with reasonable fallback metadata.
+- [x] Malformed lines do not abort the entire import.
+- [x] Import output reports inserted, skipped, and failed counts.
+- [x] The implementation leaves room for `.bash_history` import later without adding bash support in this task.
 
 **Verification Commands:**
 

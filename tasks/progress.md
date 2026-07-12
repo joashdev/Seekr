@@ -1,5 +1,6 @@
 # Seekr MVP Progress
 
+- 2026-07-11 - Task 06: Added `.zsh_history` import for extended, plain, and backslash-continued commands with SQLite persistence and import counts.
 - 2026-07-11 - Task 05: Added ranked FTS-backed CLI search with result limits and local command metadata output.
 - 2026-07-09 - Task 04: Added a hidden capture entrypoint plus SQLite insert/recent helpers that preserve raw commands and populate normalized search text.
 - 2026-07-09 - Task 03: Added SQLite initialization with idempotent migrations, metadata indexes, and FTS-backed command search schema coverage.

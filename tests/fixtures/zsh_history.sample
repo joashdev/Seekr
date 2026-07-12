@@ -1,0 +1,13 @@
+: 1700000000:0;git status
+: 1700000001:2;cargo test
+plain history command
+
+: invalid:0;broken command
+: 1700000002:1;printf 'first \
+second'
+: 1700000005:0;printf 'metadata-looking \
+: continuation'
+: 1700000006:0;echo \
+: 1700000007:0;git log
+: plain colon command
+: 1700000004:0;
