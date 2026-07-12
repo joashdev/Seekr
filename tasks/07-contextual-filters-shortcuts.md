@@ -1,6 +1,6 @@
 # 07 - Add Contextual Filters and First-Class Shortcuts
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Tests covering filter combinations and shortcut behavior.
 
 **Acceptance Criteria:**
-- [ ] `seekr here` prioritizes or filters to commands from the current cwd or current git repo.
-- [ ] `seekr failed` returns only commands with non-zero exit codes.
-- [ ] `seekr search <query>` can be filtered by cwd, repo, branch, exit status, and time window.
-- [ ] Filters use indexed SQLite metadata fields where applicable.
-- [ ] Running outside a git repo produces useful results instead of an error.
-- [ ] Tests cover successful, failed, cwd, repo, branch, and time-window filtering.
+- [x] `seekr here` prioritizes or filters to commands from the current cwd or current git repo.
+- [x] `seekr failed` returns only commands with non-zero exit codes.
+- [x] `seekr search <query>` can be filtered by cwd, repo, branch, exit status, and time window.
+- [x] Filters use indexed SQLite metadata fields where applicable.
+- [x] Running outside a git repo produces useful results instead of an error.
+- [x] Tests cover successful, failed, cwd, repo, branch, and time-window filtering.
 
 **Verification Commands:**
 

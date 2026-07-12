@@ -2,8 +2,10 @@ pub mod config;
 pub mod db;
 
 use clap::{Args, Parser, Subcommand};
+use std::env;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 const CLI_ABOUT: &str =
     "Seekr is a local-first CLI and future TUI for recalling terminal commands.";
@@ -54,6 +56,59 @@ pub struct SearchArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=100)
     )]
     pub limit: usize,
+    /// Restrict results to this working directory.
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Restrict results to this git repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Restrict results to this git branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Restrict results to non-zero exit codes.
+    #[arg(long, conflicts_with = "successful")]
+    pub failed: bool,
+    /// Restrict results to successful commands.
+    #[arg(long, conflicts_with = "failed")]
+    pub successful: bool,
+    /// Restrict results to commands captured at or after this Unix timestamp.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Restrict results to commands captured at or before this Unix timestamp.
+    #[arg(long)]
+    pub before: Option<i64>,
+}
+
+impl Default for SearchArgs {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: 10,
+            cwd: None,
+            repo: None,
+            branch: None,
+            failed: false,
+            successful: false,
+            since: None,
+            before: None,
+        }
+    }
+}
+
+impl SearchArgs {
+    fn filters(&self) -> db::SearchFilters {
+        db::SearchFilters {
+            cwd: self.cwd.clone(),
+            repo: self.repo.clone(),
+            branch: self.branch.clone(),
+            failed: self
+                .failed
+                .then_some(true)
+                .or(self.successful.then_some(false)),
+            since: self.since,
+            before: self.before,
+        }
+    }
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -85,8 +140,8 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
                 .to_string(),
         ),
         Some(Command::Search(args)) => search(args),
-        Some(Command::Here) => Ok("`seekr here` is not implemented yet.".to_string()),
-        Some(Command::Failed) => Ok("`seekr failed` is not implemented yet.".to_string()),
+        Some(Command::Here) => here(),
+        Some(Command::Failed) => failed(),
         Some(Command::Import { path }) => Ok(format!(
             "`seekr import {}` is not implemented yet.",
             path.display()
@@ -99,10 +154,68 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
 fn search(args: SearchArgs) -> io::Result<String> {
     let paths = config::ResolvedPaths::from_env()?;
     let connection = db::open(&paths.database_file())?;
-    let records = db::search_command_records(&connection, &args.query, args.limit)?;
+    let records =
+        db::filtered_command_records(&connection, Some(&args.query), &args.filters(), args.limit)?;
+
+    render_records(
+        records,
+        format!("No local commands found for {:?}.", args.query),
+    )
+}
+
+fn here() -> io::Result<String> {
+    let cwd = env::current_dir()?;
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    let mut records = db::filtered_command_records(
+        &connection,
+        None,
+        &db::SearchFilters {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            ..db::SearchFilters::default()
+        },
+        10,
+    )?;
 
     if records.is_empty() {
-        return Ok(format!("No local commands found for {:?}.", args.query));
+        if let Some(repo) = git_context(&cwd).repo {
+            records = db::filtered_command_records(
+                &connection,
+                None,
+                &db::SearchFilters {
+                    repo: Some(repo),
+                    ..db::SearchFilters::default()
+                },
+                10,
+            )?;
+        }
+    }
+
+    render_records(
+        records,
+        "No local commands found for the current context.".to_string(),
+    )
+}
+
+fn failed() -> io::Result<String> {
+    let paths = config::ResolvedPaths::from_env()?;
+    let connection = db::open(&paths.database_file())?;
+    let records = db::filtered_command_records(
+        &connection,
+        None,
+        &db::SearchFilters {
+            failed: Some(true),
+            ..db::SearchFilters::default()
+        },
+        10,
+    )?;
+
+    render_records(records, "No local failed commands found.".to_string())
+}
+
+fn render_records(records: Vec<db::CommandRecord>, empty_message: String) -> io::Result<String> {
+    if records.is_empty() {
+        return Ok(empty_message);
     }
 
     Ok(records
@@ -122,6 +235,33 @@ fn search(args: SearchArgs) -> io::Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitContext {
+    repo: Option<String>,
+    branch: Option<String>,
+}
+
+fn git_context(cwd: &Path) -> GitContext {
+    GitContext {
+        repo: git_output(cwd, &["rev-parse", "--show-toplevel"]),
+        branch: git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
+    }
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn capture(args: CaptureArgs) -> io::Result<String> {
@@ -144,7 +284,7 @@ fn capture(args: CaptureArgs) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, CaptureArgs, Cli, Command, SearchArgs};
+    use super::{dispatch, git_context, CaptureArgs, Cli, Command, ProcessCommand, SearchArgs};
     use clap::{CommandFactory, Parser};
     use std::env;
     use std::ffi::OsString;
@@ -162,6 +302,7 @@ mod tests {
                 Some(Command::Search(SearchArgs {
                     query: "docker".to_string(),
                     limit: 10,
+                    ..SearchArgs::default()
                 })),
             ),
             (
@@ -169,6 +310,33 @@ mod tests {
                 Some(Command::Search(SearchArgs {
                     query: "docker".to_string(),
                     limit: 2,
+                    ..SearchArgs::default()
+                })),
+            ),
+            (
+                vec![
+                    "seekr", "search", "docker", "--cwd", "/tmp/app", "--repo", "app", "--branch",
+                    "main", "--failed", "--since", "100", "--before", "200",
+                ],
+                Some(Command::Search(SearchArgs {
+                    query: "docker".to_string(),
+                    limit: 10,
+                    cwd: Some("/tmp/app".to_string()),
+                    repo: Some("app".to_string()),
+                    branch: Some("main".to_string()),
+                    failed: true,
+                    since: Some(100),
+                    before: Some(200),
+                    ..SearchArgs::default()
+                })),
+            ),
+            (
+                vec!["seekr", "search", "docker", "--successful"],
+                Some(Command::Search(SearchArgs {
+                    query: "docker".to_string(),
+                    limit: 10,
+                    successful: true,
+                    ..SearchArgs::default()
                 })),
             ),
             (vec!["seekr", "here"], Some(Command::Here)),
@@ -215,23 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_distinct_placeholder_messages() {
+    fn dispatches_remaining_placeholder_messages() {
         let cases = [
             (
                 Cli { command: None },
                 "Seekr TUI is not implemented yet. Network access remains disabled on this path.",
-            ),
-            (
-                Cli {
-                    command: Some(Command::Here),
-                },
-                "`seekr here` is not implemented yet.",
-            ),
-            (
-                Cli {
-                    command: Some(Command::Failed),
-                },
-                "`seekr failed` is not implemented yet.",
             ),
             (
                 Cli {
@@ -269,6 +425,7 @@ mod tests {
             command: Some(Command::Search(SearchArgs {
                 query: "docker".to_string(),
                 limit: 10,
+                ..SearchArgs::default()
             })),
         })
         .expect("empty search should succeed");
@@ -498,6 +655,7 @@ mod tests {
             command: Some(Command::Search(SearchArgs {
                 query: "docker".to_string(),
                 limit: 10,
+                ..SearchArgs::default()
             })),
         })
         .expect("search should succeed");
@@ -511,6 +669,102 @@ mod tests {
         assert!(output.contains("exit: 0"));
         assert!(output.contains("repo: seekr"));
         assert!(output.contains("branch: main"));
+    }
+
+    #[test]
+    fn shortcuts_return_contextual_and_failed_records() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("shortcuts");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        let original_cwd = env::current_dir().expect("current directory");
+        let repo_path = root.join("repo");
+        let git_init = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo_path)
+            .status()
+            .expect("git should run");
+        assert!(git_init.success());
+        env::set_current_dir(repo_path).expect("fixture should become current directory");
+        let cwd_path = env::current_dir().expect("fixture current directory");
+        let cwd = cwd_path.to_string_lossy().into_owned();
+        let repo = git_context(&cwd_path)
+            .repo
+            .expect("fixture should be a git repo");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        for (command_text, command_cwd, exit_code) in [
+            ("cargo test", cwd.as_str(), 0),
+            ("docker compose up", "/tmp/other", 1),
+        ] {
+            let record = crate::db::CommandRecord::new(
+                command_text.to_string(),
+                command_cwd.to_string(),
+                1_720_000_000,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            crate::db::insert_command_record(&connection, &record).expect("record should insert");
+        }
+        let record = crate::db::CommandRecord::new(
+            "git status".to_string(),
+            "/tmp/repo-context".to_string(),
+            1_720_000_001,
+            0,
+            None,
+            None,
+            None,
+            Some(repo),
+            None,
+        )
+        .expect("record should validate");
+        crate::db::insert_command_record(&connection, &record).expect("record should insert");
+
+        let here = dispatch(Cli {
+            command: Some(Command::Here),
+        })
+        .expect("here should search");
+        let failed = dispatch(Cli {
+            command: Some(Command::Failed),
+        })
+        .expect("failed should search");
+        connection
+            .execute("DELETE FROM commands WHERE cwd = ?1", [&cwd])
+            .expect("current directory record should delete");
+        let repo_here = dispatch(Cli {
+            command: Some(Command::Here),
+        })
+        .expect("here should fall back to repo");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+        env::set_current_dir(original_cwd).expect("current directory should restore");
+
+        assert!(here.contains("cargo test"));
+        assert!(!here.contains("docker compose up"));
+        assert!(failed.contains("docker compose up"));
+        assert!(!failed.contains("cargo test"));
+        assert!(repo_here.contains("git status"));
+    }
+
+    #[test]
+    fn git_context_is_empty_outside_a_repository() {
+        let context = git_context(&temp_root("outside-git"));
+
+        assert_eq!(context.repo, None);
+        assert_eq!(context.branch, None);
     }
 
     fn temp_root(label: &str) -> PathBuf {
