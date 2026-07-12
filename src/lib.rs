@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod privacy;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::env;
@@ -414,8 +415,16 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn capture(args: CaptureArgs) -> io::Result<String> {
+    let paths = config::ResolvedPaths::from_env()?;
+    let config = config::load(&paths)?;
+
+    let command_text = match privacy::filter_command(&args.command_text, &config.privacy) {
+        Some(filtered) => filtered,
+        None => return Ok(String::new()),
+    };
+
     let record = db::CommandRecord::new(
-        args.command_text,
+        command_text,
         args.cwd,
         args.executed_at,
         args.exit_code,
@@ -425,7 +434,6 @@ fn capture(args: CaptureArgs) -> io::Result<String> {
         args.git_repo,
         args.git_branch,
     )?;
-    let paths = config::ResolvedPaths::from_env()?;
     let connection = db::open(&paths.database_file())?;
     db::insert_command_record(&connection, &record)?;
     Ok(String::new())
@@ -456,6 +464,7 @@ fn import(path: PathBuf) -> io::Result<String> {
     .map_err(io::Error::other)?;
     let cwd = std::env::current_dir()?.display().to_string();
     let paths = config::ResolvedPaths::from_env()?;
+    let config = config::load(&paths)?;
     let connection = db::open(&paths.database_file())?;
     let mut inserted = 0;
     let mut skipped = 0;
@@ -476,8 +485,16 @@ fn import(path: PathBuf) -> io::Result<String> {
             continue;
         }
 
+        let command_text = match privacy::filter_command(&entry.command_text, &config.privacy) {
+            Some(filtered) => filtered,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
         let record = match db::CommandRecord::new(
-            entry.command_text,
+            command_text,
             cwd.clone(),
             entry.executed_at,
             0,
@@ -1341,6 +1358,353 @@ exit
 
         assert_eq!(context.repo, None);
         assert_eq!(context.branch, None);
+    }
+
+    #[test]
+    fn default_capture_preserves_raw_commands() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture-privacy-default");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let _ = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "export PASSWORD=mysecret123 && deploy".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect("capture should succeed");
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 5).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].command_text,
+            "export PASSWORD=mysecret123 && deploy"
+        );
+    }
+
+    #[test]
+    fn enabled_redaction_masks_secrets_in_capture() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture-redact");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[privacy]\nredaction_enabled = true\n",
+        )
+        .expect("config file");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let _ = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "export PASSWORD=mysecret123 && deploy".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect("capture should succeed");
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 5).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].command_text,
+            "export PASSWORD=<REDACTED> && deploy"
+        );
+    }
+
+    #[test]
+    fn noisy_commands_are_suppressed_in_capture() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture-noise");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        for noisy in ["ls -la", "cd /tmp", "pwd", "clear"] {
+            let _ = dispatch(Cli {
+                command: Some(Command::Capture(CaptureArgs {
+                    command_text: noisy.to_string(),
+                    cwd: "/tmp/project".to_string(),
+                    executed_at: 1_720_000_000,
+                    exit_code: 0,
+                    shell: None,
+                    duration_ms: None,
+                    hostname: None,
+                    git_repo: None,
+                    git_branch: None,
+                })),
+            })
+            .expect("capture should succeed");
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 10).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn custom_ignore_pattern_suppresses_capture() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("capture-custom-ignore");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[privacy]\nignore_commands = [\"docker\", \"kubectl\"]\n",
+        )
+        .expect("config file");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let _ = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "docker compose up".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect("capture should succeed");
+
+        let _ = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "cargo test".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect("capture should succeed");
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 5).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command_text, "cargo test");
+    }
+
+    #[test]
+    fn import_with_redaction_enabled_masks_secrets_and_suppresses_noise() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("import-privacy");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[privacy]\nredaction_enabled = true\n",
+        )
+        .expect("config file");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Import {
+                path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/zsh_history_with_secrets.sample"),
+            }),
+        })
+        .expect("import should succeed");
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 20).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        // 10 entries, minus 2 noisy (ls -la, cd /tmp) = 8 inserted
+        assert_eq!(
+            output,
+            "Import complete: inserted: 8, skipped: 2, failed: 0."
+        );
+        assert_eq!(records.len(), 8);
+
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "export PASSWORD=<REDACTED>"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text.contains("Bearer <REDACTED>")));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "API_KEY=<REDACTED> python script.py"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "plain safe command"));
+        assert!(records.iter().any(|r| r.command_text == "gh pr status"));
+    }
+
+    #[test]
+    fn import_with_defaults_preserves_raw_commands() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("import-defaults");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Import {
+                path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/zsh_history_with_secrets.sample"),
+            }),
+        })
+        .expect("import should succeed");
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        let records =
+            crate::db::recent_command_records(&connection, 20).expect("records should load");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        // 10 entries, minus 2 noisy (ls -la, cd /tmp) = 8 inserted
+        assert_eq!(
+            output,
+            "Import complete: inserted: 8, skipped: 2, failed: 0."
+        );
+        assert_eq!(records.len(), 8);
+
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "export PASSWORD=mysecret123"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text.contains("Bearer abcdef123456")));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "plain safe command"));
+    }
+
+    #[test]
+    fn search_does_not_leak_redacted_secrets() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search-redacted");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[privacy]\nredaction_enabled = true\n",
+        )
+        .expect("config file");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let _ = dispatch(Cli {
+            command: Some(Command::Capture(CaptureArgs {
+                command_text: "export PASSWORD=mysecret123".to_string(),
+                cwd: "/tmp/project".to_string(),
+                executed_at: 1_720_000_000,
+                exit_code: 0,
+                shell: None,
+                duration_ms: None,
+                hostname: None,
+                git_repo: None,
+                git_branch: None,
+            })),
+        })
+        .expect("capture should succeed");
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "password".to_string(),
+                limit: 10,
+                ..SearchArgs::default()
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(!output.contains("mysecret123"));
+        assert!(output.contains("PASSWORD=<REDACTED>"));
     }
 
     fn temp_root(label: &str) -> PathBuf {
