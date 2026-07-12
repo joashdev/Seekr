@@ -1,7 +1,7 @@
 pub mod config;
 pub mod db;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::env;
 use std::fs;
 use std::io;
@@ -40,6 +40,8 @@ pub enum Command {
         /// Path to a shell history file, such as ~/.zsh_history.
         path: PathBuf,
     },
+    /// Print shell hook code; add it to the matching shell startup file or eval its output.
+    Init(InitArgs),
     #[command(hide = true)]
     Capture(CaptureArgs),
     /// Show local usage and index health statistics.
@@ -114,6 +116,18 @@ impl SearchArgs {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
+pub struct InitArgs {
+    /// Shell to integrate.
+    pub shell: HookShell,
+}
+
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+pub enum HookShell {
+    Zsh,
+    Bash,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
 pub struct CaptureArgs {
     #[arg(long = "command-text")]
     pub command_text: String,
@@ -145,10 +159,146 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
         Some(Command::Here) => here(),
         Some(Command::Failed) => failed(),
         Some(Command::Import { path }) => import(path),
+        Some(Command::Init(args)) => Ok(shell_hook(args.shell).to_string()),
         Some(Command::Capture(args)) => capture(args),
         Some(Command::Stats) => config::stats_report(),
     }
 }
+
+fn shell_hook(shell: HookShell) -> &'static str {
+    match shell {
+        HookShell::Zsh => ZSH_HOOK,
+        HookShell::Bash => BASH_HOOK,
+    }
+}
+
+const ZSH_HOOK: &str = r#"# Add this to ~/.zshrc, or run: eval "$(seekr init zsh)"
+autoload -Uz add-zsh-hook
+zmodload zsh/datetime
+
+typeset -g SEEKR_COMMAND=""
+typeset -g SEEKR_STARTED_AT_MS=0
+typeset -g SEEKR_EXECUTED_AT=0
+typeset -g SEEKR_CWD=""
+typeset -g SEEKR_HOSTNAME=""
+typeset -g SEEKR_GIT_REPO=""
+typeset -g SEEKR_GIT_BRANCH=""
+
+_seekr_preexec() {
+  SEEKR_COMMAND=$1
+  SEEKR_CWD=$PWD
+  SEEKR_HOSTNAME=$(hostname)
+  SEEKR_GIT_REPO=$(git rev-parse --show-toplevel 2>/dev/null) || SEEKR_GIT_REPO=""
+  SEEKR_GIT_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || SEEKR_GIT_BRANCH=""
+  printf -v SEEKR_STARTED_AT_MS '%.0f' "$(( EPOCHREALTIME * 1000 ))"
+  SEEKR_EXECUTED_AT=$(( SEEKR_STARTED_AT_MS / 1000 ))
+}
+
+_seekr_precmd() {
+  local exit_code=$?
+  local finished_at_ms duration_ms
+  local -a args
+
+  [[ -n $SEEKR_COMMAND ]] || return
+  printf -v finished_at_ms '%.0f' "$(( EPOCHREALTIME * 1000 ))"
+  duration_ms=$(( finished_at_ms - SEEKR_STARTED_AT_MS ))
+  args=(
+    --command-text "$SEEKR_COMMAND"
+    --cwd "$SEEKR_CWD"
+    --executed-at "$SEEKR_EXECUTED_AT"
+    --exit-code "$exit_code"
+    --shell zsh
+    --duration-ms "$duration_ms"
+    --hostname "$SEEKR_HOSTNAME"
+  )
+  [[ -n $SEEKR_GIT_REPO ]] && args+=(--git-repo "$SEEKR_GIT_REPO")
+  [[ -n $SEEKR_GIT_BRANCH ]] && args+=(--git-branch "$SEEKR_GIT_BRANCH")
+  seekr capture "${args[@]}" >/dev/null 2>&1
+  SEEKR_COMMAND=""
+}
+
+add-zsh-hook preexec _seekr_preexec
+add-zsh-hook precmd _seekr_precmd
+"#;
+
+const BASH_HOOK: &str = r#"# Add this to ~/.bashrc, or run: eval "$(seekr init bash)"
+# Bash exposes submitted compound commands through history, not DEBUG. Commands
+# excluded by HISTCONTROL/HISTIGNORE fall back to their first simple command.
+# Seekr must own the DEBUG trap to snapshot command-start metadata. If another
+# integration also needs DEBUG, source Seekr first and let that integration chain it.
+SEEKR_COMMAND=""
+SEEKR_STARTED_AT_MS=0
+SEEKR_EXECUTED_AT=0
+SEEKR_CWD=""
+SEEKR_HOSTNAME=""
+SEEKR_GIT_REPO=""
+SEEKR_GIT_BRANCH=""
+SEEKR_LAST_HISTORY=""
+SEEKR_READY=0
+case "$PROMPT_COMMAND" in
+  '_seekr_precmd "$?"') SEEKR_PROMPT_COMMAND=${SEEKR_PROMPT_COMMAND:-} ;;
+  *) SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND ;;
+esac
+
+_seekr_now_ms() {
+  perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'
+}
+
+_seekr_preexec() {
+  local command=$BASH_COMMAND
+
+  [[ $SEEKR_READY == 1 ]] || return
+  SEEKR_READY=0
+  SEEKR_COMMAND=$command
+  SEEKR_CWD=$PWD
+  SEEKR_HOSTNAME=$(hostname)
+  SEEKR_GIT_REPO=$(git rev-parse --show-toplevel 2>/dev/null) || SEEKR_GIT_REPO=""
+  SEEKR_GIT_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || SEEKR_GIT_BRANCH=""
+  SEEKR_STARTED_AT_MS=$(_seekr_now_ms)
+  SEEKR_EXECUTED_AT=$(( SEEKR_STARTED_AT_MS / 1000 ))
+}
+
+_seekr_precmd() {
+  local exit_code=$1
+  local finished_at_ms history_line duration_ms
+  local HISTTIMEFORMAT=
+  local -a args
+
+  trap - DEBUG
+  finished_at_ms=$(_seekr_now_ms)
+  if [[ -n $SEEKR_PROMPT_COMMAND ]]; then
+    (exit "$exit_code")
+    eval "$SEEKR_PROMPT_COMMAND"
+  fi
+
+  if [[ -n $SEEKR_COMMAND ]]; then
+    history_line=$(builtin history 1)
+    if [[ $history_line != "$SEEKR_LAST_HISTORY" && $history_line =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
+      SEEKR_COMMAND=${BASH_REMATCH[2]}
+    fi
+    duration_ms=$(( finished_at_ms - SEEKR_STARTED_AT_MS ))
+    args=(
+      --command-text "$SEEKR_COMMAND"
+      --cwd "$SEEKR_CWD"
+      --executed-at "$SEEKR_EXECUTED_AT"
+      --exit-code "$exit_code"
+      --shell bash
+      --duration-ms "$duration_ms"
+      --hostname "$SEEKR_HOSTNAME"
+    )
+    [[ -n $SEEKR_GIT_REPO ]] && args+=(--git-repo "$SEEKR_GIT_REPO")
+    [[ -n $SEEKR_GIT_BRANCH ]] && args+=(--git-branch "$SEEKR_GIT_BRANCH")
+    seekr capture "${args[@]}" >/dev/null 2>&1
+  fi
+  SEEKR_COMMAND=""
+  SEEKR_LAST_HISTORY=$(builtin history 1)
+  SEEKR_READY=1
+  trap '_seekr_preexec' DEBUG
+}
+
+trap '_seekr_preexec' DEBUG
+PROMPT_COMMAND='_seekr_precmd "$?"'
+"#;
 
 fn search(args: SearchArgs) -> io::Result<String> {
     let paths = config::ResolvedPaths::from_env()?;
@@ -433,14 +583,15 @@ fn parse_extended_history_entry(metadata: &str) -> ParsedHistoryEntry {
 mod tests {
     use super::{
         dispatch, git_context, parse_zsh_history, CaptureArgs, Cli, Command, HistoryEntry,
-        ParsedHistoryEntry, ProcessCommand, SearchArgs,
+        HookShell, InitArgs, ParsedHistoryEntry, ProcessCommand, SearchArgs,
     };
     use clap::{CommandFactory, Parser};
     use std::env;
     use std::ffi::OsString;
     use std::fs;
-    use std::io;
+    use std::io::{self, Write};
     use std::path::PathBuf;
+    use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -496,6 +647,12 @@ mod tests {
                 Some(Command::Import {
                     path: PathBuf::from("~/.zsh_history"),
                 }),
+            ),
+            (
+                vec!["seekr", "init", "zsh"],
+                Some(Command::Init(InitArgs {
+                    shell: HookShell::Zsh,
+                })),
             ),
             (
                 vec![
@@ -625,10 +782,131 @@ mod tests {
         assert!(help.contains("here"));
         assert!(help.contains("failed"));
         assert!(help.contains("import"));
+        assert!(help.contains("init"));
         assert!(help.contains("stats"));
         assert!(!help
             .lines()
             .any(|line| line.trim_start().starts_with("capture")));
+    }
+
+    #[test]
+    fn zsh_hook_uses_lifecycle_hooks_and_capture_metadata() {
+        let output = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+
+        assert!(output.contains("add-zsh-hook preexec _seekr_preexec"));
+        assert!(output.contains("add-zsh-hook precmd _seekr_precmd"));
+        assert!(output.contains("zmodload zsh/datetime"));
+        assert!(output.contains("SEEKR_CWD=$PWD"));
+        assert!(output.contains("EPOCHREALTIME * 1000"));
+        assert_capture_fields(&output, "zsh");
+        assert!(output.contains("~/.zshrc"));
+        assert_shell_syntax("zsh", &output);
+    }
+
+    #[test]
+    fn bash_hook_uses_debug_trap_and_prompt_command() {
+        let output = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Bash,
+            })),
+        })
+        .expect("bash hook should render");
+
+        assert!(output.contains("trap '_seekr_preexec' DEBUG"));
+        assert!(output.contains("history_line=$(builtin history 1)"));
+        assert!(output.contains("[[ $SEEKR_READY == 1 ]] || return"));
+        assert!(output.contains("SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND"));
+        assert!(output.contains("PROMPT_COMMAND='_seekr_precmd \"$?\"'"));
+        assert!(output.contains("Seekr must own the DEBUG trap"));
+        assert_capture_fields(&output, "bash");
+        assert!(output.contains("~/.bashrc"));
+        assert_shell_syntax("bash", &output);
+    }
+
+    #[test]
+    fn bash_hook_captures_one_full_history_line_and_preserves_prompt_status() {
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Bash,
+            })),
+        })
+        .expect("bash hook should render");
+        let root = temp_root("bash-hook");
+        let log = root.join("captures");
+        let command = "cd /tmp; sleep 0.05; printf alpha | sed s/alpha/beta/; printf gamma";
+        let input = format!(
+            r#"seekr() {{ printf 'ARG=<%s>\n' "$@" >> "$SEEKR_TEST_LOG"; printf 'END\n' >> "$SEEKR_TEST_LOG"; }}
+PROMPT_COMMAND='printf "OLD_STATUS=%s\n" "$?"'
+eval "$SEEKR_TEST_HOOK"
+eval "$SEEKR_TEST_HOOK"
+{command}
+false
+exit
+"#
+        );
+        let mut child = ProcessCommand::new("bash")
+            .args(["--noprofile", "--norc", "-i"])
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_LOG", &log)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("bash should start");
+        child
+            .stdin
+            .take()
+            .expect("bash stdin")
+            .write_all(input.as_bytes())
+            .expect("bash input should write");
+        let output = child.wait_with_output().expect("bash should finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let captures = fs::read_to_string(log).expect("capture log should exist");
+
+        assert!(stdout.contains("OLD_STATUS=1"));
+        assert_eq!(captures.matches("END\n").count(), 2);
+        assert!(captures.contains(&format!("ARG=<--command-text>\nARG=<{command}>")));
+        assert!(captures.contains(&format!(
+            "ARG=<--cwd>\nARG=<{}>",
+            env!("CARGO_MANIFEST_DIR")
+        )));
+    }
+
+    fn assert_capture_fields(output: &str, shell: &str) {
+        for field in [
+            "seekr capture",
+            "--command-text",
+            "--cwd",
+            "--executed-at",
+            "--exit-code",
+            "--duration-ms",
+            "--hostname",
+            "--git-repo",
+            "--git-branch",
+        ] {
+            assert!(output.contains(field), "missing {field}");
+        }
+        assert!(output.contains(&format!("--shell {shell}")));
+    }
+
+    fn assert_shell_syntax(shell: &str, hook: &str) {
+        let mut child = ProcessCommand::new(shell)
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("{shell} should start: {error}"));
+        child
+            .stdin
+            .take()
+            .expect("shell stdin")
+            .write_all(hook.as_bytes())
+            .expect("hook should write");
+        assert!(child.wait().expect("shell should finish").success());
     }
 
     #[test]

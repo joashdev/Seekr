@@ -1,6 +1,6 @@
 # 08 - Add Shell Hook Generation for Zsh and Bash
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -16,12 +16,12 @@
 - Tests for generated hook output containing the expected capture invocation and metadata fields.
 
 **Acceptance Criteria:**
-- [ ] zsh hook output uses appropriate zsh lifecycle hooks, such as `preexec` and `precmd`, to capture command and exit status.
-- [ ] bash hook output uses bash-compatible mechanisms such as `DEBUG` trap and `PROMPT_COMMAND` without requiring a full shell replacement.
-- [ ] Generated hooks call the Seekr capture entrypoint with command, cwd, timestamp, and exit code.
-- [ ] Generated hooks include shell, duration, hostname, git repo, and git branch when available.
-- [ ] Hook generation does not write to shell startup files automatically.
-- [ ] Tests verify zsh and bash hook output includes required fields.
+- [x] zsh hook output uses appropriate zsh lifecycle hooks, such as `preexec` and `precmd`, to capture command and exit status.
+- [x] bash hook output uses bash-compatible mechanisms such as `DEBUG` trap and `PROMPT_COMMAND` without requiring a full shell replacement.
+- [x] Generated hooks call the Seekr capture entrypoint with command, cwd, timestamp, and exit code.
+- [x] Generated hooks include shell, duration, hostname, git repo, and git branch when available.
+- [x] Hook generation does not write to shell startup files automatically.
+- [x] Tests verify zsh and bash hook output includes required fields.
 
 **Verification Commands:**
 
