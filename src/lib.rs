@@ -304,11 +304,15 @@ PROMPT_COMMAND='_seekr_precmd "$?"'
 fn search(args: SearchArgs) -> io::Result<String> {
     let paths = config::ResolvedPaths::from_env()?;
     let connection = db::open(&paths.database_file())?;
-    let records =
-        db::filtered_command_records(&connection, Some(&args.query), &args.filters(), args.limit)?;
+    let collapsed = db::filtered_collapsed_records(
+        &connection,
+        Some(&args.query),
+        &args.filters(),
+        args.limit,
+    )?;
 
-    render_records(
-        records,
+    render_collapsed_records(
+        collapsed,
         format!("No local commands found for {:?}.", args.query),
     )
 }
@@ -317,7 +321,7 @@ fn here() -> io::Result<String> {
     let cwd = env::current_dir()?;
     let paths = config::ResolvedPaths::from_env()?;
     let connection = db::open(&paths.database_file())?;
-    let mut records = db::filtered_command_records(
+    let collapsed = db::filtered_collapsed_records(
         &connection,
         None,
         &db::SearchFilters {
@@ -327,9 +331,9 @@ fn here() -> io::Result<String> {
         10,
     )?;
 
-    if records.is_empty() {
+    if collapsed.is_empty() {
         if let Some(repo) = git_context(&cwd).repo {
-            records = db::filtered_command_records(
+            let collapsed = db::filtered_collapsed_records(
                 &connection,
                 None,
                 &db::SearchFilters {
@@ -338,11 +342,15 @@ fn here() -> io::Result<String> {
                 },
                 10,
             )?;
+            return render_collapsed_records(
+                collapsed,
+                "No local commands found for the current context.".to_string(),
+            );
         }
     }
 
-    render_records(
-        records,
+    render_collapsed_records(
+        collapsed,
         "No local commands found for the current context.".to_string(),
     )
 }
@@ -350,7 +358,7 @@ fn here() -> io::Result<String> {
 fn failed() -> io::Result<String> {
     let paths = config::ResolvedPaths::from_env()?;
     let connection = db::open(&paths.database_file())?;
-    let records = db::filtered_command_records(
+    let collapsed = db::filtered_collapsed_records(
         &connection,
         None,
         &db::SearchFilters {
@@ -360,25 +368,38 @@ fn failed() -> io::Result<String> {
         10,
     )?;
 
-    render_records(records, "No local failed commands found.".to_string())
+    render_collapsed_records(collapsed, "No local failed commands found.".to_string())
 }
 
-fn render_records(records: Vec<db::CommandRecord>, empty_message: String) -> io::Result<String> {
-    if records.is_empty() {
+fn render_collapsed_records(
+    collapsed: Vec<db::CollapsedRecord>,
+    empty_message: String,
+) -> io::Result<String> {
+    if collapsed.is_empty() {
         return Ok(empty_message);
     }
 
-    Ok(records
+    Ok(collapsed
         .iter()
         .map(|record| {
+            let repeat = if record.repeat_count > 1 {
+                format!(" | repeats: {}", record.repeat_count)
+            } else {
+                String::new()
+            };
+            let exit = if record.all_same_exit {
+                format!("{}", record.most_recent_exit_code)
+            } else {
+                format!("mixed (most recent: {})", record.most_recent_exit_code)
+            };
             let mut metadata = format!(
-                "  cwd: {} | timestamp: {} | exit: {}",
-                record.cwd, record.executed_at, record.exit_code
+                "  cwd: {} | timestamp: {} | exit: {}{}",
+                record.most_recent_cwd, record.most_recent_executed_at, exit, repeat
             );
-            if let Some(repo) = &record.git_repo {
+            if let Some(repo) = &record.repo {
                 metadata.push_str(&format!(" | repo: {repo}"));
             }
-            if let Some(branch) = &record.git_branch {
+            if let Some(branch) = &record.branch {
                 metadata.push_str(&format!(" | branch: {branch}"));
             }
             format!("{}\n{metadata}", record.command_text)
@@ -1720,6 +1741,209 @@ exit
 
         assert!(!output.contains("mysecret123"));
         assert!(output.contains("PASSWORD=<REDACTED>"));
+    }
+
+    #[test]
+    fn collapsed_search_shows_repeat_count_and_exit_summary() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search-collapse");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        for (executed_at, exit_code) in [(1_720_000_000, 0), (1_720_000_001, 0), (1_720_000_002, 1)]
+        {
+            let record = crate::db::CommandRecord::new(
+                "cargo build".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            crate::db::insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "cargo".to_string(),
+                limit: 10,
+                ..SearchArgs::default()
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("cargo build"));
+        assert!(output.contains("repeats: 3"));
+        assert!(output.contains("exit: mixed (most recent: 1)"));
+        assert!(output.contains("cwd: /tmp/project"));
+        assert!(output.contains("timestamp: 1720000002"));
+    }
+
+    #[test]
+    fn collapsed_search_same_exit_codes_show_single_value() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("search-collapse-same");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        for executed_at in [1_720_000_000, 1_720_000_001] {
+            let record = crate::db::CommandRecord::new(
+                "git push".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            crate::db::insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "git".to_string(),
+                limit: 10,
+                ..SearchArgs::default()
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("git push"));
+        assert!(output.contains("repeats: 2"));
+        assert!(output.contains("exit: 0"));
+        assert!(!output.contains("mixed"));
+    }
+
+    #[test]
+    fn collapsed_failed_shows_only_failed_commands() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("failed-collapse");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        for (command_text, executed_at, exit_code) in [
+            ("docker compose up", 1_720_000_000, 0),
+            ("docker compose up", 1_720_000_001, 1),
+            ("docker compose up", 1_720_000_002, 1),
+        ] {
+            let record = crate::db::CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            crate::db::insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Failed),
+        })
+        .expect("failed should search");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("docker compose up"));
+        assert!(output.contains("repeats: 2"));
+        assert!(output.contains("exit: 1"));
+        assert!(!output.contains("exit: 0"));
+    }
+
+    #[test]
+    fn collapsed_search_with_contextual_filters_still_collapses() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("collapse-filters");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let connection = crate::db::open(&data_dir.join("seekr.db")).expect("database should open");
+        for (command_text, cwd, executed_at, exit_code) in [
+            ("npm install", "/tmp/app-a", 1_720_000_000, 0),
+            ("npm install", "/tmp/app-a", 1_720_000_001, 0),
+            ("npm install", "/tmp/app-b", 1_720_000_002, 0),
+        ] {
+            let record = crate::db::CommandRecord::new(
+                command_text.to_string(),
+                cwd.to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            crate::db::insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let output = dispatch(Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "npm".to_string(),
+                limit: 10,
+                cwd: Some("/tmp/app-a".to_string()),
+                ..SearchArgs::default()
+            })),
+        })
+        .expect("search should succeed");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("npm install"));
+        assert!(output.contains("repeats: 2"));
+        assert!(output.contains("cwd: /tmp/app-a"));
+        assert!(!output.contains("/tmp/app-b"));
     }
 
     fn temp_root(label: &str) -> PathBuf {

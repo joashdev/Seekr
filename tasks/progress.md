@@ -1,5 +1,6 @@
 # Seekr MVP Progress
 
+- 2026-07-12 - Task 10: Added duplicate command collapse in search results with repeat count, exit-summary display, FTS-preserving ranking, and context-filter-aware deduplication.
 - 2026-07-12 - Task 07: Added indexed contextual search filters plus `here` and `failed` shortcuts with safe git context detection.
 - 2026-07-12 - Task 08: Added zsh and bash shell-hook generation that captures command metadata through `seekr capture`.
 - 2026-07-11 - Task 06: Added `.zsh_history` import for extended, plain, and backslash-continued commands with SQLite persistence and import counts.

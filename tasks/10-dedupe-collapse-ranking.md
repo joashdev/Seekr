@@ -1,6 +1,6 @@
 # 10 - Collapse Duplicate Commands in Search Results
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -16,12 +16,12 @@
 - Tests covering duplicate insertion, collapsed display data, and ranking behavior.
 
 **Acceptance Criteria:**
-- [ ] Identical repeated commands appear as a single collapsed search result by default.
-- [ ] Collapsed results expose repeat count and most recent execution metadata.
-- [ ] Failed and successful runs remain distinguishable enough for `seekr failed`.
-- [ ] Context filters still work correctly with collapsed results.
-- [ ] The raw command selected for reuse remains exact and runnable.
-- [ ] Tests cover collapsed search with and without contextual filters.
+- [x] Identical repeated commands appear as a single collapsed search result by default.
+- [x] Collapsed results expose repeat count and most recent execution metadata.
+- [x] Failed and successful runs remain distinguishable enough for `seekr failed`.
+- [x] Context filters still work correctly with collapsed results.
+- [x] The raw command selected for reuse remains exact and runnable.
+- [x] Tests cover collapsed search with and without contextual filters.
 
 **Verification Commands:**
 

@@ -1,4 +1,5 @@
 use rusqlite::{params, types::Value, Connection};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -74,6 +75,19 @@ pub struct SearchFilters {
     pub failed: Option<bool>,
     pub since: Option<i64>,
     pub before: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollapsedRecord {
+    pub command_text: String,
+    pub normalized_text: String,
+    pub repeat_count: usize,
+    pub most_recent_executed_at: i64,
+    pub most_recent_cwd: String,
+    pub most_recent_exit_code: i64,
+    pub all_same_exit: bool,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
 }
 
 impl CommandRecord {
@@ -376,6 +390,70 @@ pub fn filtered_command_records(
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(io::Error::other)
+}
+
+pub fn filtered_collapsed_records(
+    connection: &Connection,
+    query: Option<&str>,
+    filters: &SearchFilters,
+    limit: usize,
+) -> io::Result<Vec<CollapsedRecord>> {
+    // ponytail: limit is applied pre-collapse, so a heavily-duplicated command
+    // can crowd out diverse results and the returned group count <= raw limit.
+    // Upgrade: SQL GROUP BY (normalized_text, cwd, git_repo, git_branch) with
+    // paginated LIMIT once the noisy-duplicate ceiling bites at real scale.
+    // ponytail: repeat_count is display-only for MVP; ranking stays FTS bm25 +
+    // recency to avoid harming relevance. Count-weighted ranking deferred to v0.2.
+    let records = filtered_command_records(connection, query, filters, limit)?;
+    Ok(collapse_records(records))
+}
+
+fn collapse_records(records: Vec<CommandRecord>) -> Vec<CollapsedRecord> {
+    type CollapseKey = (String, String, Option<String>, Option<String>);
+    let mut groups: HashMap<CollapseKey, Vec<CommandRecord>> = HashMap::new();
+    let mut order: Vec<CollapseKey> = Vec::new();
+
+    for record in records {
+        let key = (
+            record.normalized_text.clone(),
+            record.cwd.clone(),
+            record.git_repo.clone(),
+            record.git_branch.clone(),
+        );
+        match groups.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().push(record);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                order.push(key);
+                entry.insert(vec![record]);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let mut group = groups.remove(&key)?;
+            group.sort_by_key(|r| std::cmp::Reverse(r.executed_at));
+
+            let newest = &group[0];
+            let exit_codes: Vec<i64> = group.iter().map(|r| r.exit_code).collect();
+            let all_same_exit = exit_codes.iter().all(|c| *c == exit_codes[0]);
+
+            Some(CollapsedRecord {
+                command_text: newest.command_text.clone(),
+                normalized_text: key.0,
+                repeat_count: group.len(),
+                most_recent_executed_at: newest.executed_at,
+                most_recent_cwd: key.1,
+                most_recent_exit_code: newest.exit_code,
+                all_same_exit,
+                repo: key.2,
+                branch: key.3,
+            })
+        })
+        .collect()
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
@@ -747,6 +825,336 @@ mod tests {
 
         assert_eq!(record.command_text, ":");
         assert!(record.normalized_text.is_empty());
+    }
+
+    #[test]
+    fn collapse_merges_duplicate_commands_into_single_result() {
+        let root = temp_root("db-collapse");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, executed_at, exit_code) in [
+            ("cargo test", 1_720_000_000, 0),
+            ("cargo test", 1_720_000_001, 0),
+            ("cargo test", 1_720_000_002, 0),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("cargo"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].command_text, "cargo test");
+        assert_eq!(collapsed[0].repeat_count, 3);
+        assert_eq!(collapsed[0].most_recent_executed_at, 1_720_000_002);
+        assert!(collapsed[0].all_same_exit);
+    }
+
+    #[test]
+    fn collapse_preserves_most_recent_raw_command_text() {
+        let root = temp_root("db-collapse-text");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        let record = CommandRecord::new(
+            "cargo   test  --release".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_000,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &record).expect("insert should succeed");
+
+        let record = CommandRecord::new(
+            "cargo test --release".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_001,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &record).expect("insert should succeed");
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("cargo"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].command_text, "cargo test --release");
+        assert_eq!(collapsed[0].repeat_count, 2);
+    }
+
+    #[test]
+    fn collapse_detects_mixed_exit_codes() {
+        let root = temp_root("db-collapse-exit");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, executed_at, exit_code) in [
+            ("git push", 1_720_000_000, 0),
+            ("git push", 1_720_000_001, 1),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("git"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].repeat_count, 2);
+        assert!(!collapsed[0].all_same_exit);
+        assert_eq!(collapsed[0].most_recent_exit_code, 1);
+    }
+
+    #[test]
+    fn collapse_separates_by_cwd() {
+        let root = temp_root("db-collapse-cwd");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (cwd, executed_at) in [
+            ("/tmp/project-a", 1_720_000_000),
+            ("/tmp/project-b", 1_720_000_001),
+        ] {
+            let record = CommandRecord::new(
+                "cargo test".to_string(),
+                cwd.to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("cargo"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 2);
+        for c in &collapsed {
+            assert_eq!(c.command_text, "cargo test");
+            assert_eq!(c.repeat_count, 1);
+        }
+    }
+
+    #[test]
+    fn collapse_separates_by_repo_and_branch() {
+        let root = temp_root("db-collapse-repo");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (repo, branch, executed_at) in [
+            (Some("seekr"), Some("main"), 1_720_000_000),
+            (Some("seekr"), Some("feat/other"), 1_720_000_001),
+        ] {
+            let record = CommandRecord::new(
+                "cargo build".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                repo.map(str::to_string),
+                branch.map(str::to_string),
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("cargo"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[test]
+    fn collapse_applies_contextual_filters_before_collapsing() {
+        let root = temp_root("db-collapse-filters");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, cwd, executed_at, exit_code) in [
+            ("docker compose up", "/tmp/app", 1_720_000_000, 0),
+            ("docker compose up", "/tmp/app", 1_720_000_001, 1),
+            ("docker compose down", "/tmp/other", 1_720_000_002, 0),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                cwd.to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("docker"),
+            &SearchFilters {
+                failed: Some(true),
+                ..SearchFilters::default()
+            },
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].command_text, "docker compose up");
+        assert_eq!(collapsed[0].repeat_count, 1);
+        assert_eq!(collapsed[0].most_recent_exit_code, 1);
+        assert!(collapsed[0].all_same_exit);
+    }
+
+    #[test]
+    fn collapse_preserves_fts_order_without_count_weighting() {
+        // MVP ranking is FTS bm25 + recency; repeat_count is display-only.
+        // Pinned so count-weighted ranking (v0.2) doesn't silently land.
+        let root = temp_root("db-collapse-order");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for executed_at in [1_720_000_000, 1_720_000_001] {
+            let record = CommandRecord::new(
+                "cargo test".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+        let record = CommandRecord::new(
+            "cargo build".to_string(),
+            "/tmp/project".to_string(),
+            1_720_000_002,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &record).expect("record should insert");
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("cargo"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        // bm25 ties on the single term "cargo"; recency tie-break puts the newer
+        // "cargo build" group first even though "cargo test" has the higher count.
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].command_text, "cargo build");
+        assert_eq!(collapsed[0].repeat_count, 1);
+        assert_eq!(collapsed[1].command_text, "cargo test");
+        assert_eq!(collapsed[1].repeat_count, 2);
+    }
+
+    #[test]
+    fn collapse_ranks_by_fts_relevance_first() {
+        let root = temp_root("db-collapse-rank");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, executed_at) in [
+            ("docker compose logs", 1_720_000_000),
+            ("docker compose up", 1_720_000_001),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let collapsed = super::filtered_collapsed_records(
+            &connection,
+            Some("compose"),
+            &SearchFilters::default(),
+            5,
+        )
+        .expect("collapsed search should succeed");
+
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].command_text, "docker compose up");
     }
 
     fn names_for(connection: &Connection, object_type: &str) -> HashSet<String> {
