@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 static REDACTION_PATTERNS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
     let specs: &[(&str, &str)] = &[
         (
-            r"(?i)(?:\b|(_))(password|passwd|pass|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|api[_-]?secret|auth[_-]?token|access[_-]?key[_-]?id)\s*=\s*\S+",
+            r"(?i)(?:\b|(_))(password|passwd|pass|pwd|secret[_-]?access[_-]?key|secret|token|access_token|refresh_token|api[_-]?key|apikey|api[_-]?secret|auth[_-]?token|access[_-]?key[_-]?id)\s*=\s*\S+",
             "${1}${2}=<REDACTED>",
         ),
         (
@@ -31,12 +31,14 @@ static REDACTION_PATTERNS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
 pub fn filter_command(command_text: &str, config: &PrivacyConfig) -> Option<String> {
     let first_token = command_text.split_whitespace().next().unwrap_or("");
 
-    // ponytail: simple first-token match covers ls, cd, pwd, clear, and all user patterns.
-    if config
-        .ignore_commands
-        .iter()
-        .any(|pattern| first_token == pattern.as_str())
-    {
+    // Match single-word patterns against the first token, multi-word patterns against the full command.
+    if config.ignore_commands.iter().any(|pattern| {
+        if pattern.contains(char::is_whitespace) {
+            command_text == pattern.as_str()
+        } else {
+            first_token == pattern.as_str()
+        }
+    }) {
         return None;
     }
 
@@ -113,6 +115,24 @@ mod tests {
         assert_eq!(
             filter_command("cargo test", &config),
             Some("cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn multi_word_ignore_patterns_are_respected() {
+        let config = PrivacyConfig {
+            redaction_enabled: false,
+            ignore_commands: vec!["git status".to_string()],
+        };
+
+        assert_eq!(filter_command("git status", &config), None);
+        assert_eq!(
+            filter_command("git status --short", &config),
+            Some("git status --short".to_string())
+        );
+        assert_eq!(
+            filter_command("git push", &config),
+            Some("git push".to_string())
         );
     }
 
@@ -235,6 +255,26 @@ mod tests {
         assert_eq!(
             filter_command("access_key_id=AKIA1234567890ABCDEF aws s3 ls", &config,),
             Some("access_key_id=<REDACTED> aws s3 ls".to_string())
+        );
+    }
+
+    #[test]
+    fn redaction_masks_secret_access_key_assignments() {
+        let config = redaction_enabled_privacy();
+
+        assert_eq!(
+            filter_command(
+                "AWS_SECRET_ACCESS_KEY=wJalrXutnFEMI/K7MDENG aws s3 ls",
+                &config
+            ),
+            Some("AWS_SECRET_ACCESS_KEY=<REDACTED> aws s3 ls".to_string())
+        );
+        assert_eq!(
+            filter_command(
+                "secret_access_key=wJalrXutnFEMI curl https://example.com",
+                &config
+            ),
+            Some("secret_access_key=<REDACTED> curl https://example.com".to_string())
         );
     }
 

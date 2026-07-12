@@ -1588,12 +1588,12 @@ exit
         restore_env("SEEKR_CONFIG_DIR", original_config_dir);
         restore_env("SEEKR_DATA_DIR", original_data_dir);
 
-        // 10 entries, minus 2 noisy (ls -la, cd /tmp) = 8 inserted
+        // 11 entries, minus 2 noisy (ls -la, cd /tmp) = 9 inserted
         assert_eq!(
             output,
-            "Import complete: inserted: 8, skipped: 2, failed: 0."
+            "Import complete: inserted: 9, skipped: 2, failed: 0."
         );
-        assert_eq!(records.len(), 8);
+        assert_eq!(records.len(), 9);
 
         assert!(records
             .iter()
@@ -1607,6 +1607,9 @@ exit
         assert!(records
             .iter()
             .any(|r| r.command_text == "AWS_ACCESS_KEY_ID=<REDACTED> aws s3 ls"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "AWS_SECRET_ACCESS_KEY=<REDACTED> aws s3 ls"));
         assert!(records
             .iter()
             .any(|r| r.command_text == "git push --token <REDACTED>"));
@@ -1647,12 +1650,12 @@ exit
         restore_env("SEEKR_CONFIG_DIR", original_config_dir);
         restore_env("SEEKR_DATA_DIR", original_data_dir);
 
-        // 10 entries, minus 2 noisy (ls -la, cd /tmp) = 8 inserted
+        // 11 entries, minus 2 noisy (ls -la, cd /tmp) = 9 inserted
         assert_eq!(
             output,
-            "Import complete: inserted: 8, skipped: 2, failed: 0."
+            "Import complete: inserted: 9, skipped: 2, failed: 0."
         );
-        assert_eq!(records.len(), 8);
+        assert_eq!(records.len(), 9);
 
         assert!(records
             .iter()
@@ -1660,6 +1663,9 @@ exit
         assert!(records
             .iter()
             .any(|r| r.command_text.contains("Bearer abcdef123456")));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "AWS_SECRET_ACCESS_KEY=wJalrXutnFEMI/K7MDENG aws s3 ls"));
         assert!(records
             .iter()
             .any(|r| r.command_text == "plain safe command"));
