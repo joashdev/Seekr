@@ -1606,6 +1606,15 @@ exit
             .any(|r| r.command_text == "API_KEY=<REDACTED> python script.py"));
         assert!(records
             .iter()
+            .any(|r| r.command_text == "AWS_ACCESS_KEY_ID=<REDACTED> aws s3 ls"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "git push --token <REDACTED>"));
+        assert!(records
+            .iter()
+            .any(|r| r.command_text == "npm config set _authToken=<REDACTED>"));
+        assert!(records
+            .iter()
             .any(|r| r.command_text == "plain safe command"));
         assert!(records.iter().any(|r| r.command_text == "gh pr status"));
     }

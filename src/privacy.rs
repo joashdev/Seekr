@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 static REDACTION_PATTERNS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
     let specs: &[(&str, &str)] = &[
         (
-            r"(?i)(?:\b|(_))(password|passwd|pass|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|api[_-]?secret)\s*=\s*\S+",
+            r"(?i)(?:\b|(_))(password|passwd|pass|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|api[_-]?secret|auth[_-]?token|access[_-]?key[_-]?id)\s*=\s*\S+",
             "${1}${2}=<REDACTED>",
         ),
         (
@@ -208,6 +208,34 @@ mod tests {
         let command = "export PASSWORD=mysecret123 && deploy --token ghp_abc";
 
         assert_eq!(filter_command(command, &config), Some(command.to_string()));
+    }
+
+    #[test]
+    fn redaction_masks_auth_token_assignments() {
+        let config = redaction_enabled_privacy();
+
+        assert_eq!(
+            filter_command("npm config set _authToken=npm_abc123def456", &config),
+            Some("npm config set _authToken=<REDACTED>".to_string())
+        );
+        assert_eq!(
+            filter_command("auth_token=secret123 curl api.example.com", &config),
+            Some("auth_token=<REDACTED> curl api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn redaction_masks_access_key_id_assignments() {
+        let config = redaction_enabled_privacy();
+
+        assert_eq!(
+            filter_command("AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF aws s3 ls", &config,),
+            Some("AWS_ACCESS_KEY_ID=<REDACTED> aws s3 ls".to_string())
+        );
+        assert_eq!(
+            filter_command("access_key_id=AKIA1234567890ABCDEF aws s3 ls", &config,),
+            Some("access_key_id=<REDACTED> aws s3 ls".to_string())
+        );
     }
 
     #[test]
