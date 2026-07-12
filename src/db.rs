@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Value, Connection};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -64,6 +64,16 @@ pub struct CommandRecord {
     pub hostname: Option<String>,
     pub git_repo: Option<String>,
     pub git_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub cwd: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub failed: Option<bool>,
+    pub since: Option<i64>,
+    pub before: Option<i64>,
 }
 
 impl CommandRecord {
@@ -240,6 +250,15 @@ pub fn search_command_records(
     query: &str,
     limit: usize,
 ) -> io::Result<Vec<CommandRecord>> {
+    filtered_command_records(connection, Some(query), &SearchFilters::default(), limit)
+}
+
+pub fn filtered_command_records(
+    connection: &Connection,
+    query: Option<&str>,
+    filters: &SearchFilters,
+    limit: usize,
+) -> io::Result<Vec<CommandRecord>> {
     let limit = i64::try_from(limit)
         .ok()
         .filter(|limit| (1..=100).contains(limit))
@@ -249,37 +268,97 @@ pub fn search_command_records(
                 "limit must be between 1 and 100",
             )
         })?;
-    let query = normalize_command_text(query)
-        .split_whitespace()
-        .map(|term| format!("\"{term}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if query.is_empty() {
-        return Ok(Vec::new());
+    if filters.since.is_some_and(|since| since < 0)
+        || filters.before.is_some_and(|before| before < 0)
+        || matches!((filters.since, filters.before), (Some(since), Some(before)) if since > before)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid time window",
+        ));
     }
 
-    let mut statement = connection
-        .prepare(
-            "SELECT
-                commands.command_text,
-                commands.normalized_text,
-                commands.cwd,
-                commands.executed_at,
-                commands.exit_code,
-                commands.shell,
-                commands.duration_ms,
-                commands.hostname,
-                commands.git_repo,
-                commands.git_branch
-             FROM commands_fts
-             JOIN commands ON commands.id = commands_fts.rowid
-             WHERE commands_fts MATCH ?1
-             ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC
-             LIMIT ?2",
-        )
-        .map_err(io::Error::other)?;
+    let query_provided = query.is_some();
+    let query = query
+        .map(normalize_command_text)
+        .filter(|query| !query.is_empty())
+        .map(|query| {
+            query
+                .split_whitespace()
+                .map(|term| format!("\"{term}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    if query_provided && query.is_none() {
+        return Ok(Vec::new());
+    }
+    let has_query = query.is_some();
+
+    let mut sql = String::from(
+        "SELECT
+            commands.command_text,
+            commands.normalized_text,
+            commands.cwd,
+            commands.executed_at,
+            commands.exit_code,
+            commands.shell,
+            commands.duration_ms,
+            commands.hostname,
+            commands.git_repo,
+            commands.git_branch
+         FROM ",
+    );
+    if has_query {
+        sql.push_str("commands_fts JOIN commands ON commands.id = commands_fts.rowid");
+    } else {
+        sql.push_str("commands");
+    }
+
+    let mut clauses: Vec<String> = Vec::new();
+    let mut values = Vec::new();
+    if let Some(query) = query {
+        clauses.push("commands_fts MATCH ?".to_string());
+        values.push(Value::Text(query));
+    }
+    for (column, value) in [
+        ("commands.cwd", filters.cwd.as_ref()),
+        ("commands.git_repo", filters.repo.as_ref()),
+        ("commands.git_branch", filters.branch.as_ref()),
+    ] {
+        if let Some(value) = value {
+            clauses.push(format!("{column} = ?"));
+            values.push(Value::Text(value.clone()));
+        }
+    }
+    if let Some(failed) = filters.failed {
+        clauses.push(if failed {
+            "commands.exit_code != 0".to_string()
+        } else {
+            "commands.exit_code = 0".to_string()
+        });
+    }
+    if let Some(since) = filters.since {
+        clauses.push("commands.executed_at >= ?".to_string());
+        values.push(Value::Integer(since));
+    }
+    if let Some(before) = filters.before {
+        clauses.push("commands.executed_at <= ?".to_string());
+        values.push(Value::Integer(before));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(if has_query {
+        " ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC LIMIT ?"
+    } else {
+        " ORDER BY commands.executed_at DESC, commands.id DESC LIMIT ?"
+    });
+    values.push(Value::Integer(limit));
+
+    let mut statement = connection.prepare(&sql).map_err(io::Error::other)?;
     let rows = statement
-        .query_map(params![query, limit], |row| {
+        .query_map(rusqlite::params_from_iter(values), |row| {
             Ok(CommandRecord {
                 command_text: row.get(0)?,
                 normalized_text: row.get(1)?,
@@ -325,7 +404,8 @@ fn normalize_command_text(command_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_command_record, open, recent_command_records, search_command_records, CommandRecord,
+        filtered_command_records, insert_command_record, open, recent_command_records,
+        search_command_records, CommandRecord, SearchFilters,
     };
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
@@ -539,6 +619,84 @@ mod tests {
                 .expect_err("invalid limit should fail");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn filters_search_results_by_metadata_and_time_window() {
+        let root = temp_root("db-filtered-search");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, cwd, executed_at, exit_code, repo, branch) in [
+            (
+                "docker compose up",
+                "/tmp/app",
+                100,
+                0,
+                Some("app"),
+                Some("main"),
+            ),
+            (
+                "docker compose logs",
+                "/tmp/app",
+                200,
+                1,
+                Some("app"),
+                Some("fix"),
+            ),
+            (
+                "docker compose down",
+                "/tmp/other",
+                300,
+                1,
+                Some("other"),
+                Some("main"),
+            ),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                cwd.to_string(),
+                executed_at,
+                exit_code,
+                None,
+                None,
+                None,
+                repo.map(str::to_string),
+                branch.map(str::to_string),
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let records = filtered_command_records(
+            &connection,
+            Some("docker"),
+            &SearchFilters {
+                cwd: Some("/tmp/app".to_string()),
+                repo: Some("app".to_string()),
+                branch: Some("fix".to_string()),
+                failed: Some(true),
+                since: Some(150),
+                before: Some(250),
+            },
+            10,
+        )
+        .expect("filters should search");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command_text, "docker compose logs");
+
+        let successful = filtered_command_records(
+            &connection,
+            Some("docker"),
+            &SearchFilters {
+                failed: Some(false),
+                ..SearchFilters::default()
+            },
+            10,
+        )
+        .expect("successful filter should search");
+        assert_eq!(successful.len(), 1);
+        assert_eq!(successful[0].command_text, "docker compose up");
     }
 
     #[test]
