@@ -227,8 +227,10 @@ fn parse_zsh_history(history: &[u8], fallback_timestamp: i64) -> Vec<ParsedHisto
             continue;
         };
 
+        let extended_metadata = extended_history_metadata(line);
+
         if let Some(ParsedHistoryEntry::Entry(entry)) = entries.last_mut() {
-            if entry.command_text.ends_with('\\') {
+            if entry.command_text.ends_with('\\') && extended_metadata.is_none() {
                 entry.command_text.push('\n');
                 entry.command_text.push_str(line);
                 continue;
@@ -237,11 +239,7 @@ fn parse_zsh_history(history: &[u8], fallback_timestamp: i64) -> Vec<ParsedHisto
 
         if line.trim().is_empty() {
             entries.push(ParsedHistoryEntry::Skipped);
-        } else if let Some(metadata) = line.strip_prefix(": ").filter(|metadata| {
-            metadata
-                .split_once(';')
-                .is_some_and(|(metadata, _)| metadata.contains(':'))
-        }) {
+        } else if let Some(metadata) = extended_metadata {
             entries.push(parse_extended_history_entry(metadata));
         } else {
             entries.push(ParsedHistoryEntry::Entry(HistoryEntry {
@@ -253,6 +251,14 @@ fn parse_zsh_history(history: &[u8], fallback_timestamp: i64) -> Vec<ParsedHisto
     }
 
     entries
+}
+
+fn extended_history_metadata(line: &str) -> Option<&str> {
+    line.strip_prefix(": ").filter(|metadata| {
+        metadata
+            .split_once(';')
+            .is_some_and(|(metadata, _)| metadata.contains(':'))
+    })
 }
 
 fn parse_extended_history_entry(metadata: &str) -> ParsedHistoryEntry {
@@ -639,6 +645,16 @@ mod tests {
                     duration_ms: Some(0),
                 }),
                 ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "echo \\".to_string(),
+                    executed_at: 1_700_000_006,
+                    duration_ms: Some(0),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
+                    command_text: "git log".to_string(),
+                    executed_at: 1_700_000_007,
+                    duration_ms: Some(0),
+                }),
+                ParsedHistoryEntry::Entry(HistoryEntry {
                     command_text: ": plain colon command".to_string(),
                     executed_at: 1_700_000_003,
                     duration_ms: None,
@@ -682,9 +698,9 @@ mod tests {
 
         assert_eq!(
             output,
-            "Import complete: inserted: 6, skipped: 2, failed: 1."
+            "Import complete: inserted: 8, skipped: 2, failed: 1."
         );
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 8);
         assert!(records.iter().any(|record| {
             record.command_text == "git status"
                 && record.executed_at == 1_700_000_000
@@ -700,6 +716,12 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.command_text == "printf 'metadata-looking \\\n: continuation'"
         }));
+        assert!(records
+            .iter()
+            .any(|record| record.command_text == "echo \\"));
+        assert!(records
+            .iter()
+            .any(|record| record.command_text == "git log"));
         assert!(records
             .iter()
             .any(|record| record.command_text == ": plain colon command"));
