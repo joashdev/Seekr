@@ -235,7 +235,10 @@ SEEKR_GIT_REPO=""
 SEEKR_GIT_BRANCH=""
 SEEKR_LAST_HISTORY=""
 SEEKR_READY=0
-SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND
+case "$PROMPT_COMMAND" in
+  '_seekr_precmd "$?"') SEEKR_PROMPT_COMMAND=${SEEKR_PROMPT_COMMAND:-} ;;
+  *) SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND ;;
+esac
 
 _seekr_now_ms() {
   perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'
@@ -839,6 +842,7 @@ mod tests {
         let input = format!(
             r#"seekr() {{ printf 'ARG=<%s>\n' "$@" >> "$SEEKR_TEST_LOG"; printf 'END\n' >> "$SEEKR_TEST_LOG"; }}
 PROMPT_COMMAND='printf "OLD_STATUS=%s\n" "$?"'
+eval "$SEEKR_TEST_HOOK"
 eval "$SEEKR_TEST_HOOK"
 {command}
 false
