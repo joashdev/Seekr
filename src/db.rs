@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 1;
 const MIGRATION_001: &str = "
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY,

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod privacy;
+pub mod stats;
 pub mod tui;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -160,7 +161,7 @@ pub fn dispatch(cli: Cli) -> io::Result<String> {
         Some(Command::Import { path }) => import(path),
         Some(Command::Init(args)) => Ok(shell_hook(args.shell).to_string()),
         Some(Command::Capture(args)) => capture(args),
-        Some(Command::Stats) => config::stats_report(),
+        Some(Command::Stats) => stats::stats_report(),
     }
 }
 
@@ -782,15 +783,13 @@ mod tests {
         restore_env("SEEKR_CONFIG_DIR", original_config_dir);
         restore_env("SEEKR_DATA_DIR", original_data_dir);
 
-        assert!(output.contains("Seekr paths:"));
-        assert!(output.contains("config dir:"));
-        assert!(output.contains("data dir:"));
-        assert!(output.contains("config file:"));
-        assert!(output.contains("database:"));
-        assert!(output.contains("redaction enabled: false"));
-        assert!(output.contains("noisy command ignore candidates: ls, cd, pwd, clear"));
-        assert!(data_dir.is_dir());
-        assert!(data_dir.join("seekr.db").is_file());
+        assert!(output.contains("Seekr Stats"));
+        assert!(output.contains("Database:"));
+        assert!(output.contains(&format!("Path: {}", data_dir.join("seekr.db").display())));
+        assert!(output.contains("Redaction: disabled"));
+        assert!(output.contains("Ignore rules: 4"));
+        assert!(output.contains("Database: missing"));
+        assert!(!data_dir.exists());
     }
 
     #[test]
