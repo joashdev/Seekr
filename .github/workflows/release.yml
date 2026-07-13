@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: read-all
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          test "v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          }
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+          archive="seekr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C target/release -czf "$archive" seekr
+
+      - name: Generate provenance subject
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="seekr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "hashes=$(sha256sum "$archive" | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: seekr-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  approve:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Confirm release approval
+        run: echo "Release approved for $GITHUB_REF_NAME"
+
+  provenance:
+    needs: [build, approve]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      upload-assets: true
+      draft-release: true
+
+  publish:
+    needs: [build, approve, provenance]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: dist
+
+      - name: Upload archive to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release edit "$GITHUB_REF_NAME"
+          --draft=false
+          --latest
+          --title "Seekr $GITHUB_REF_NAME"
+          --notes "Initial Seekr MVP release. See the README for installation and usage."

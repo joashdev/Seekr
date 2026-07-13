@@ -99,6 +99,26 @@ For the interactive behavior, use safe commands and check:
 3. Press `Enter` and verify the command is inserted/staged at the prompt and remains editable rather than executing.
 4. Press `Alt+R` and verify the visibly labeled explicit rerun action executes the selected safe command.
 
+## Releasing
+
+CI runs formatting, Clippy, tests, and the smoke script on pushes and pull requests to `main`.
+
+Only a repository administrator can create a release tag. To release, update the version in `Cargo.toml`, merge it to `main`, then push the matching tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds a Linux x86_64 archive, waits for approval from the protected `release` environment, and publishes the archive with signed SLSA provenance. Published releases and their tags are immutable.
+
+Verify a downloaded release and its assets with the GitHub CLI:
+
+```bash
+gh release verify v0.1.0 --repo joashdev/Seekr
+gh release verify-asset v0.1.0 seekr-v0.1.0-x86_64-unknown-linux-gnu.tar.gz --repo joashdev/Seekr
+```
+
 ## License
 
 Seekr is released under the MIT License. See [`LICENSE`](LICENSE) for details.
