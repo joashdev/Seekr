@@ -176,6 +176,10 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
         ]
     };
 
+    copy_with_providers(text, providers)
+}
+
+fn copy_with_providers(text: &str, providers: &[(&str, &[&str])]) -> io::Result<()> {
     for (program, args) in providers {
         let Ok(mut child) = Command::new(program)
             .args(*args)
@@ -184,12 +188,14 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
         else {
             continue;
         };
-        child
+        let wrote = child
             .stdin
             .take()
             .expect("piped stdin")
-            .write_all(text.as_bytes())?;
-        if child.wait()?.success() {
+            .write_all(text.as_bytes())
+            .is_ok();
+        let status = child.wait();
+        if wrote && status.is_ok_and(|status| status.success()) {
             return Ok(());
         }
     }
@@ -545,6 +551,35 @@ mod tests {
             "insert\nprintf 'one  two'\nprintf three"
         );
         assert_eq!(shell_output("rerun", "cargo test"), "rerun\ncargo test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_falls_back_after_provider_write_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "seekr-clipboard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp directory should be created");
+        let output = root.join("clipboard");
+        let script = format!("cat > '{}'", output.display());
+        let large_text = "clipboard fallback".repeat(100_000);
+
+        copy_with_providers(
+            &large_text,
+            &[("false", &[]), ("sh", &["-c", script.as_str()])],
+        )
+        .expect("second provider should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(output).expect("clipboard output should exist"),
+            large_text
+        );
+        std::fs::remove_dir_all(root).expect("temp directory should be removed");
     }
 
     fn record(command_text: &str) -> db::CollapsedRecord {
