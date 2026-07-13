@@ -1,6 +1,7 @@
 # Seekr MVP Progress
 
 - 2026-07-12 - Task 13: Implemented comprehensive stats command with database health, command counts, collapse info, and privacy status reporting.
+- 2026-07-12 - Task 11: Added interactive ratatui-based TUI search flow with live filtering, keyboard navigation, and command preview.
 - 2026-07-12 - Task 10: Added duplicate command collapse in search results with repeat count, exit-summary display, FTS-preserving ranking, and context-filter-aware deduplication.
 - 2026-07-12 - Task 07: Added indexed contextual search filters plus `here` and `failed` shortcuts with safe git context detection.
 - 2026-07-12 - Task 08: Added zsh and bash shell-hook generation that captures command metadata through `seekr capture`.
