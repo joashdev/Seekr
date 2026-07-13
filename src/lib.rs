@@ -799,8 +799,8 @@ mod tests {
         assert!(output.contains(&format!("Path: {}", data_dir.join("seekr.db").display())));
         assert!(output.contains("Redaction: disabled"));
         assert!(output.contains("Ignore rules: 4"));
-        assert!(data_dir.is_dir());
-        assert!(data_dir.join("seekr.db").is_file());
+        assert!(output.contains("Database: missing"));
+        assert!(!data_dir.exists());
     }
 
     #[test]

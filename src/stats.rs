@@ -1,5 +1,6 @@
 use crate::config::{self, ResolvedPaths};
 use crate::db;
+use rusqlite::{Connection, OpenFlags};
 use std::io;
 
 pub fn stats_report() -> io::Result<String> {
@@ -7,7 +8,12 @@ pub fn stats_report() -> io::Result<String> {
     let config = config::load(&paths)?;
     let database_path = paths.database_file();
 
-    let connection = db::open(&database_path).ok();
+    let database_exists = database_path.exists();
+    let connection = database_exists
+        .then(|| Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY))
+        .transpose()
+        .ok()
+        .flatten();
 
     let mut output = String::from("Seekr Stats\n===========\n\n");
 
@@ -36,9 +42,7 @@ pub fn stats_report() -> io::Result<String> {
             .unwrap_or(0);
         output.push_str(&format!("  Total stored: {total}\n"));
 
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM commands_fts", [], |row| row.get(0))
-            .unwrap_or(0);
+        let fts_count = fts_indexed_count(conn).unwrap_or(0);
         output.push_str(&format!("  Indexed (FTS): {fts_count}\n"));
 
         let failed: i64 = conn
@@ -76,7 +80,10 @@ pub fn stats_report() -> io::Result<String> {
     if let Some(ref conn) = connection {
         let unique_groups: i64 = conn
             .query_row(
-                "SELECT COUNT(DISTINCT normalized_text) FROM commands",
+                "SELECT COUNT(*) FROM (
+                    SELECT 1 FROM commands
+                    GROUP BY normalized_text, cwd, git_repo, git_branch
+                )",
                 [],
                 |row| row.get(0),
             )
@@ -132,13 +139,23 @@ pub fn stats_report() -> io::Result<String> {
                 db::SCHEMA_VERSION
             ));
         }
-    } else {
+    } else if database_exists {
         output.push_str("  Database: unavailable\n");
+        output.push_str("  FTS index: unknown\n");
+        output.push_str("  Migrations: unknown\n");
+    } else {
+        output.push_str("  Database: missing\n");
         output.push_str("  FTS index: unknown\n");
         output.push_str("  Migrations: unknown\n");
     }
 
     Ok(output)
+}
+
+fn fts_indexed_count(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row("SELECT COUNT(*) FROM commands_fts_docsize", [], |row| {
+        row.get(0)
+    })
 }
 
 #[cfg(test)]
@@ -165,14 +182,14 @@ mod tests {
         }
 
         let connection = db::open(&data_dir.join("seekr.db")).expect("database should initialize");
-        for (command_text, executed_at, exit_code) in [
-            ("cargo test", 1_720_000_000, 0),
-            ("cargo test", 1_720_000_001, 0),
-            ("docker compose up", 1_720_000_002, 1),
+        for (command_text, cwd, executed_at, exit_code) in [
+            ("cargo test", "/tmp/project", 1_720_000_000, 0),
+            ("cargo test", "/tmp/other", 1_720_000_001, 0),
+            ("docker compose up", "/tmp/project", 1_720_000_002, 1),
         ] {
             let record = CommandRecord::new(
                 command_text.to_string(),
-                "/tmp/project".to_string(),
+                cwd.to_string(),
                 executed_at,
                 exit_code,
                 None,
@@ -187,9 +204,6 @@ mod tests {
 
         let output = stats_report().expect("stats should render");
 
-        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
-        restore_env("SEEKR_DATA_DIR", original_data_dir);
-
         assert!(output.contains("Seekr Stats"));
         assert!(output.contains("Database:"));
         assert!(output.contains(&format!("Path: {}", data_dir.join("seekr.db").display())));
@@ -199,7 +213,7 @@ mod tests {
         assert!(output.contains("Failed commands: 1"));
         assert!(output.contains("Time range: 1720000000 to 1720000002"));
         assert!(output.contains("Collapse:"));
-        assert!(output.contains("Unique groups: 2"));
+        assert!(output.contains("Unique groups: 3"));
         assert!(output.contains("Privacy:"));
         assert!(output.contains("Redaction: disabled"));
         assert!(output.contains("Ignore rules: 4"));
@@ -207,6 +221,15 @@ mod tests {
         assert!(output.contains("Database: ok"));
         assert!(output.contains("FTS index: ok"));
         assert!(output.contains("Migrations: up to date"));
+
+        connection
+            .execute("DELETE FROM commands_fts_docsize", [])
+            .expect("test should simulate a stale index");
+        let stale_output = stats_report().expect("stats should render stale index count");
+        assert!(stale_output.contains("Indexed (FTS): 0"));
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
     }
 
     #[test]
@@ -223,6 +246,7 @@ mod tests {
             env::set_var("SEEKR_DATA_DIR", &data_dir);
         }
 
+        db::open(&data_dir.join("seekr.db")).expect("database should initialize");
         let output = stats_report().expect("stats should render");
 
         restore_env("SEEKR_CONFIG_DIR", original_config_dir);
@@ -235,6 +259,30 @@ mod tests {
         assert!(output.contains("Unique groups: 0"));
         assert!(output.contains("Database: ok"));
         assert!(output.contains("FTS index: ok"));
+    }
+
+    #[test]
+    fn stats_does_not_create_a_missing_database() {
+        let _guard = crate::config::env_lock().lock().expect("env lock");
+        let root = temp_root("stats-missing");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let database_path = data_dir.join("seekr.db");
+        let original_config_dir = env::var_os("SEEKR_CONFIG_DIR");
+        let original_data_dir = env::var_os("SEEKR_DATA_DIR");
+
+        unsafe {
+            env::set_var("SEEKR_CONFIG_DIR", &config_dir);
+            env::set_var("SEEKR_DATA_DIR", &data_dir);
+        }
+
+        let output = stats_report().expect("stats should render");
+
+        restore_env("SEEKR_CONFIG_DIR", original_config_dir);
+        restore_env("SEEKR_DATA_DIR", original_data_dir);
+
+        assert!(output.contains("Database: missing"));
+        assert!(!database_path.exists());
     }
 
     #[test]
