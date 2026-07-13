@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod privacy;
+pub mod tui;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::env;
@@ -152,10 +153,7 @@ pub struct CaptureArgs {
 
 pub fn dispatch(cli: Cli) -> io::Result<String> {
     match cli.command {
-        None => Ok(
-            "Seekr TUI is not implemented yet. Network access remains disabled on this path."
-                .to_string(),
-        ),
+        None => tui::run(),
         Some(Command::Search(args)) => search(args),
         Some(Command::Here) => here(),
         Some(Command::Failed) => failed(),
@@ -728,18 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_remaining_placeholder_messages() {
-        let cases = [(
-            Cli { command: None },
-            "Seekr TUI is not implemented yet. Network access remains disabled on this path.",
-        )];
-
-        for (cli, expected_message) in cases {
-            assert_eq!(
-                dispatch(cli).expect("placeholder command should dispatch"),
-                expected_message
-            );
-        }
+    fn bare_seekr_parses_as_no_subcommand() {
+        let cli = Cli::try_parse_from(["seekr"]).expect("bare seekr should parse");
+        assert_eq!(cli.command, None);
     }
 
     #[test]

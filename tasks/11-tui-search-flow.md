@@ -1,6 +1,6 @@
 # 11 - Build Interactive TUI Search Flow
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - TUI tests for state transitions and rendering where practical.
 
 **Acceptance Criteria:**
-- [ ] Running `seekr` opens the TUI instead of printing a placeholder.
-- [ ] Typing in the TUI updates results without restarting the app.
-- [ ] Results can be navigated from the keyboard.
-- [ ] The selected command preview includes raw command text and useful metadata.
-- [ ] Exiting the TUI restores the terminal state.
-- [ ] Automated tests cover TUI state logic, and manual verification covers terminal rendering.
+- [x] Running `seekr` opens the TUI instead of printing a placeholder.
+- [x] Typing in the TUI updates results without restarting the app.
+- [x] Results can be navigated from the keyboard.
+- [x] The selected command preview includes raw command text and useful metadata.
+- [x] Exiting the TUI restores the terminal state.
+- [x] Automated tests cover TUI state logic, and manual verification covers terminal rendering.
 
 **Verification Commands:**
 
