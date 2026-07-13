@@ -36,6 +36,9 @@ jobs:
             exit 1
           }
 
+      - name: Install shell test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes zsh
+
       - name: Test
         run: cargo test --locked --all-targets
 
