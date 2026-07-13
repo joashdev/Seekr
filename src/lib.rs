@@ -184,6 +184,20 @@ typeset -g SEEKR_HOSTNAME=""
 typeset -g SEEKR_GIT_REPO=""
 typeset -g SEEKR_GIT_BRANCH=""
 
+_seekr_widget() {
+  local result action command_text
+  result=$(command seekr) || return
+  [[ $result == *$'\n'* ]] || return
+  action=${result%%$'\n'*}
+  command_text=${result#*$'\n'}
+  BUFFER=$command_text
+  CURSOR=${#BUFFER}
+  [[ $action == rerun ]] && zle accept-line
+}
+
+zle -N seekr-history _seekr_widget
+bindkey '^R' seekr-history
+
 _seekr_preexec() {
   SEEKR_COMMAND=$1
   SEEKR_CWD=$PWD
@@ -235,6 +249,22 @@ SEEKR_GIT_REPO=""
 SEEKR_GIT_BRANCH=""
 SEEKR_LAST_HISTORY=""
 SEEKR_READY=0
+
+_seekr_readline() {
+  local result action command_text
+  result=$(command seekr) || return
+  [[ $result == *$'\n'* ]] || return
+  action=${result%%$'\n'*}
+  command_text=${result#*$'\n'}
+  if [[ $action == rerun ]]; then
+    _seekr_rerun "$command_text"
+  else
+    READLINE_LINE=$command_text
+    READLINE_POINT=${#READLINE_LINE}
+  fi
+}
+
+bind -x '"\C-r":_seekr_readline'
 case "$PROMPT_COMMAND" in
   '_seekr_precmd "$?"') SEEKR_PROMPT_COMMAND=${SEEKR_PROMPT_COMMAND:-} ;;
   *) SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND ;;
@@ -245,9 +275,13 @@ _seekr_now_ms() {
 }
 
 _seekr_preexec() {
-  local command=$BASH_COMMAND
-
   [[ $SEEKR_READY == 1 ]] || return
+  _seekr_start "$BASH_COMMAND"
+}
+
+_seekr_start() {
+  local command=$1
+
   SEEKR_READY=0
   SEEKR_COMMAND=$command
   SEEKR_CWD=$PWD
@@ -258,14 +292,45 @@ _seekr_preexec() {
   SEEKR_EXECUTED_AT=$(( SEEKR_STARTED_AT_MS / 1000 ))
 }
 
-_seekr_precmd() {
+_seekr_capture() {
   local exit_code=$1
-  local finished_at_ms history_line duration_ms
-  local HISTTIMEFORMAT=
+  local finished_at_ms duration_ms
   local -a args
 
-  trap - DEBUG
   finished_at_ms=$(_seekr_now_ms)
+  duration_ms=$(( finished_at_ms - SEEKR_STARTED_AT_MS ))
+  args=(
+    --command-text "$SEEKR_COMMAND"
+    --cwd "$SEEKR_CWD"
+    --executed-at "$SEEKR_EXECUTED_AT"
+    --exit-code "$exit_code"
+    --shell bash
+    --duration-ms "$duration_ms"
+    --hostname "$SEEKR_HOSTNAME"
+  )
+  [[ -n $SEEKR_GIT_REPO ]] && args+=(--git-repo "$SEEKR_GIT_REPO")
+  [[ -n $SEEKR_GIT_BRANCH ]] && args+=(--git-branch "$SEEKR_GIT_BRANCH")
+  seekr capture "${args[@]}" >/dev/null 2>&1
+}
+
+_seekr_rerun() {
+  local command_text=$1 exit_code
+
+  _seekr_start "$command_text"
+  builtin eval -- "$command_text"
+  exit_code=$?
+  _seekr_capture "$exit_code"
+  SEEKR_COMMAND=""
+  SEEKR_READY=1
+  return "$exit_code"
+}
+
+_seekr_precmd() {
+  local exit_code=$1
+  local history_line
+  local HISTTIMEFORMAT=
+
+  trap - DEBUG
   if [[ -n $SEEKR_PROMPT_COMMAND ]]; then
     (exit "$exit_code")
     eval "$SEEKR_PROMPT_COMMAND"
@@ -276,19 +341,7 @@ _seekr_precmd() {
     if [[ $history_line != "$SEEKR_LAST_HISTORY" && $history_line =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
       SEEKR_COMMAND=${BASH_REMATCH[2]}
     fi
-    duration_ms=$(( finished_at_ms - SEEKR_STARTED_AT_MS ))
-    args=(
-      --command-text "$SEEKR_COMMAND"
-      --cwd "$SEEKR_CWD"
-      --executed-at "$SEEKR_EXECUTED_AT"
-      --exit-code "$exit_code"
-      --shell bash
-      --duration-ms "$duration_ms"
-      --hostname "$SEEKR_HOSTNAME"
-    )
-    [[ -n $SEEKR_GIT_REPO ]] && args+=(--git-repo "$SEEKR_GIT_REPO")
-    [[ -n $SEEKR_GIT_BRANCH ]] && args+=(--git-branch "$SEEKR_GIT_BRANCH")
-    seekr capture "${args[@]}" >/dev/null 2>&1
+    _seekr_capture "$exit_code"
   fi
   SEEKR_COMMAND=""
   SEEKR_LAST_HISTORY=$(builtin history 1)
@@ -829,6 +882,9 @@ mod tests {
         assert!(output.contains("zmodload zsh/datetime"));
         assert!(output.contains("SEEKR_CWD=$PWD"));
         assert!(output.contains("EPOCHREALTIME * 1000"));
+        assert!(output.contains("bindkey '^R' seekr-history"));
+        assert!(output.contains("BUFFER=$command_text"));
+        assert!(output.contains("[[ $action == rerun ]] && zle accept-line"));
         assert_capture_fields(&output, "zsh");
         assert!(output.contains("~/.zshrc"));
         assert_shell_syntax("zsh", &output);
@@ -849,6 +905,11 @@ mod tests {
         assert!(output.contains("SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND"));
         assert!(output.contains("PROMPT_COMMAND='_seekr_precmd \"$?\"'"));
         assert!(output.contains("Seekr must own the DEBUG trap"));
+        assert!(output.contains("bind -x '\"\\C-r\":_seekr_readline'"));
+        assert!(output.contains("READLINE_LINE=$command_text"));
+        assert!(output.contains("_seekr_rerun \"$command_text\""));
+        assert!(output.contains("_seekr_start \"$command_text\""));
+        assert!(output.contains("_seekr_capture \"$exit_code\""));
         assert_capture_fields(&output, "bash");
         assert!(output.contains("~/.bashrc"));
         assert_shell_syntax("bash", &output);
@@ -901,6 +962,43 @@ exit
             "ARG=<--cwd>\nARG=<{}>",
             env!("CARGO_MANIFEST_DIR")
         )));
+    }
+
+    #[test]
+    fn bash_hook_captures_explicit_reruns() {
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Bash,
+            })),
+        })
+        .expect("bash hook should render");
+        let root = temp_root("bash-rerun");
+        let log = root.join("captures");
+        let input = r#"seekr() { printf 'ARG=<%s>\n' "$@" >> "$SEEKR_TEST_LOG"; printf 'END\n' >> "$SEEKR_TEST_LOG"; }
+eval "$SEEKR_TEST_HOOK"
+_seekr_rerun 'printf rerun-marker'
+"#;
+        let output = ProcessCommand::new("bash")
+            .args(["--noprofile", "--norc"])
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_LOG", &log)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("bash should start");
+        output
+            .stdin
+            .as_ref()
+            .expect("bash stdin")
+            .write_all(input.as_bytes())
+            .expect("bash input should write");
+        let output = output.wait_with_output().expect("bash should finish");
+        let captures = fs::read_to_string(log).expect("capture log should exist");
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "rerun-marker");
+        assert_eq!(captures.matches("END\n").count(), 1);
+        assert!(captures.contains("ARG=<--command-text>\nARG=<printf rerun-marker>"));
     }
 
     fn assert_capture_fields(output: &str, shell: &str) {

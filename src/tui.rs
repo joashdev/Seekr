@@ -1,6 +1,6 @@
 use crate::{config, db};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,14 +12,18 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 
 const RESULT_LIMIT: usize = 20;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Continue,
     Quit,
-    Select(String),
+    Copy(String),
+    Insert(String),
+    Rerun(String),
 }
 
 #[derive(Default)]
@@ -28,6 +32,7 @@ pub struct App {
     pub results: Vec<db::CollapsedRecord>,
     pub selected: usize,
     pub error: Option<String>,
+    pub status: Option<String>,
 }
 
 impl App {
@@ -38,31 +43,39 @@ impl App {
         }
     }
 
-    pub fn handle_key(&mut self, code: KeyCode) -> Action {
-        match code {
-            KeyCode::Esc => Action::Quit,
-            KeyCode::Enter => self
-                .results
+    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        let selected = || {
+            self.results
                 .get(self.selected)
-                .map_or(Action::Continue, |r| Action::Select(r.command_text.clone())),
-            KeyCode::Up => {
+                .map(|r| r.command_text.clone())
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::Quit,
+            (KeyCode::Enter, _) => selected().map_or(Action::Continue, Action::Insert),
+            (KeyCode::Char('c'), KeyModifiers::ALT) => {
+                selected().map_or(Action::Continue, Action::Copy)
+            }
+            (KeyCode::Char('r'), KeyModifiers::ALT) => {
+                selected().map_or(Action::Continue, Action::Rerun)
+            }
+            (KeyCode::Up, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 Action::Continue
             }
-            KeyCode::Down => {
+            (KeyCode::Down, _) => {
                 if self.selected + 1 < self.results.len() {
                     self.selected += 1;
                 }
                 Action::Continue
             }
-            KeyCode::Backspace => {
+            (KeyCode::Backspace, _) => {
                 self.input.pop();
                 if self.input.is_empty() {
                     self.set_results(Vec::new());
                 }
                 Action::Continue
             }
-            KeyCode::Char(c) => {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.input.push(c);
                 Action::Continue
             }
@@ -76,9 +89,9 @@ pub fn run() -> io::Result<String> {
     let connection = db::open(&paths.database_file())?;
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut stderr = io::stderr();
+    execute!(stderr, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(&mut terminal, &connection);
@@ -91,7 +104,7 @@ pub fn run() -> io::Result<String> {
 }
 
 fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     connection: &rusqlite::Connection,
 ) -> io::Result<String> {
     let mut app = App::default();
@@ -125,9 +138,16 @@ fn run_loop(
                 return Ok(String::new());
             }
             let previous_input = app.input.clone();
-            match app.handle_key(key.code) {
+            match app.handle_key(key) {
                 Action::Quit => return Ok(String::new()),
-                Action::Select(text) => return Ok(text),
+                Action::Insert(text) => return Ok(shell_output("insert", &text)),
+                Action::Rerun(text) => return Ok(shell_output("rerun", &text)),
+                Action::Copy(text) => {
+                    app.status = Some(match copy_to_clipboard(&text) {
+                        Ok(()) => "Copied raw command to clipboard.".to_string(),
+                        Err(error) => format!("Copy unavailable: {error}"),
+                    });
+                }
                 Action::Continue => {
                     if app.input != previous_input {
                         needs_query = true;
@@ -137,6 +157,53 @@ fn run_loop(
             }
         }
     }
+}
+
+fn shell_output(action: &str, text: &str) -> String {
+    format!("{action}\n{text}")
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let providers: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip.exe", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    copy_with_providers(text, providers)
+}
+
+fn copy_with_providers(text: &str, providers: &[(&str, &[&str])]) -> io::Result<()> {
+    for (program, args) in providers {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(text.as_bytes())
+            .is_ok();
+        let status = child.wait();
+        if wrote && status.is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no supported clipboard provider found",
+    ))
 }
 
 fn render(frame: &mut Frame, app: &App) {
@@ -266,6 +333,8 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Green),
         )]),
         Line::from(vec![Span::styled(meta, Style::default().fg(Color::Gray))]),
+        Line::from("[Enter] Insert/edit  [Alt+C] Copy  [Alt+R] Rerun (executes)"),
+        Line::from(app.status.as_deref().unwrap_or("")),
     ];
 
     let preview = Paragraph::new(Text::from(text)).block(Block::default().borders(Borders::ALL));
@@ -275,30 +344,34 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     #[test]
     fn typing_adds_characters() {
         let mut app = App::default();
-        app.handle_key(KeyCode::Char('d'));
-        app.handle_key(KeyCode::Char('o'));
-        app.handle_key(KeyCode::Char('c'));
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(key(KeyCode::Char('c')));
         assert_eq!(app.input, "doc");
     }
 
     #[test]
     fn backspace_removes_last_character() {
         let mut app = App::default();
-        app.handle_key(KeyCode::Char('a'));
-        app.handle_key(KeyCode::Char('b'));
-        app.handle_key(KeyCode::Backspace);
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.input, "a");
     }
 
     #[test]
     fn backspace_on_empty_input_does_nothing() {
         let mut app = App::default();
-        app.handle_key(KeyCode::Backspace);
+        app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.input, "");
     }
 
@@ -310,10 +383,13 @@ mod tests {
             ..App::default()
         };
 
-        app.handle_key(KeyCode::Backspace);
+        app.handle_key(key(KeyCode::Backspace));
 
         assert!(app.results.is_empty());
-        assert!(matches!(app.handle_key(KeyCode::Enter), Action::Continue));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Continue
+        ));
     }
 
     #[test]
@@ -351,13 +427,13 @@ mod tests {
         ]);
 
         assert_eq!(app.selected, 0);
-        app.handle_key(KeyCode::Down);
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.selected, 1);
-        app.handle_key(KeyCode::Down);
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.selected, 1);
-        app.handle_key(KeyCode::Up);
+        app.handle_key(key(KeyCode::Up));
         assert_eq!(app.selected, 0);
-        app.handle_key(KeyCode::Up);
+        app.handle_key(key(KeyCode::Up));
         assert_eq!(app.selected, 0);
     }
 
@@ -376,16 +452,16 @@ mod tests {
             branch: None,
         }]);
 
-        match app.handle_key(KeyCode::Enter) {
-            Action::Select(text) => assert_eq!(text, "cargo test"),
-            _ => panic!("expected Select"),
+        match app.handle_key(key(KeyCode::Enter)) {
+            Action::Insert(text) => assert_eq!(text, "cargo test"),
+            _ => panic!("expected Insert"),
         }
     }
 
     #[test]
     fn enter_on_empty_results_does_nothing() {
         let mut app = App::default();
-        match app.handle_key(KeyCode::Enter) {
+        match app.handle_key(key(KeyCode::Enter)) {
             Action::Continue => {}
             _ => panic!("expected Continue on empty results"),
         }
@@ -394,7 +470,7 @@ mod tests {
     #[test]
     fn esc_quits() {
         let mut app = App::default();
-        match app.handle_key(KeyCode::Esc) {
+        match app.handle_key(key(KeyCode::Esc)) {
             Action::Quit => {}
             _ => panic!("expected Quit"),
         }
@@ -404,7 +480,7 @@ mod tests {
     fn q_is_typed() {
         let mut app = App::default();
         assert!(matches!(
-            app.handle_key(KeyCode::Char('q')),
+            app.handle_key(key(KeyCode::Char('q'))),
             Action::Continue
         ));
         assert_eq!(app.input, "q");
@@ -437,7 +513,7 @@ mod tests {
                 branch: None,
             },
         ]);
-        app.handle_key(KeyCode::Down);
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.selected, 1);
         app.set_results(vec![db::CollapsedRecord {
             command_text: "a".into(),
@@ -451,6 +527,59 @@ mod tests {
             branch: None,
         }]);
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn copy_and_rerun_are_explicit_actions_on_raw_text() {
+        let mut app = App::default();
+        app.set_results(vec![record("cargo   test -- --exact")]);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)),
+            Action::Copy("cargo   test -- --exact".into())
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            Action::Rerun("cargo   test -- --exact".into())
+        );
+    }
+
+    #[test]
+    fn shell_output_preserves_raw_multiline_command() {
+        assert_eq!(
+            shell_output("insert", "printf 'one  two'\nprintf three"),
+            "insert\nprintf 'one  two'\nprintf three"
+        );
+        assert_eq!(shell_output("rerun", "cargo test"), "rerun\ncargo test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_falls_back_after_provider_write_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "seekr-clipboard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp directory should be created");
+        let output = root.join("clipboard");
+        let script = format!("cat > '{}'", output.display());
+        let large_text = "clipboard fallback".repeat(100_000);
+
+        copy_with_providers(
+            &large_text,
+            &[("false", &[]), ("sh", &["-c", script.as_str()])],
+        )
+        .expect("second provider should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(output).expect("clipboard output should exist"),
+            large_text
+        );
+        std::fs::remove_dir_all(root).expect("temp directory should be removed");
     }
 
     fn record(command_text: &str) -> db::CollapsedRecord {

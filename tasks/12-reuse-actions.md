@@ -1,6 +1,6 @@
 # 12 - Implement Copy, Insert, and Rerun Reuse Actions
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -17,12 +17,12 @@
 - Tests for action selection and command output behavior, with manual checks for clipboard and prompt insertion.
 
 **Acceptance Criteria:**
-- [ ] Copy action places the selected raw command on the clipboard when clipboard support is available.
-- [ ] Insert action stages the selected raw command back into the shell prompt without immediately executing it.
-- [ ] Rerun action is explicit and visually distinct from insert/stage.
-- [ ] Reuse actions operate on raw command text, not redacted or normalized search text unless redaction was applied before persistence.
-- [ ] The TUI makes the chosen action clear before returning control to the shell.
-- [ ] Tests cover action routing and shell-facing output.
+- [x] Copy action places the selected raw command on the clipboard when clipboard support is available.
+- [x] Insert action stages the selected raw command back into the shell prompt without immediately executing it.
+- [x] Rerun action is explicit and visually distinct from insert/stage.
+- [x] Reuse actions operate on raw command text, not redacted or normalized search text unless redaction was applied before persistence.
+- [x] The TUI makes the chosen action clear before returning control to the shell.
+- [x] Tests cover action routing and shell-facing output.
 
 **Verification Commands:**
 
