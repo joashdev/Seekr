@@ -184,6 +184,20 @@ typeset -g SEEKR_HOSTNAME=""
 typeset -g SEEKR_GIT_REPO=""
 typeset -g SEEKR_GIT_BRANCH=""
 
+_seekr_widget() {
+  local result action command_text
+  result=$(command seekr) || return
+  [[ $result == *$'\n'* ]] || return
+  action=${result%%$'\n'*}
+  command_text=${result#*$'\n'}
+  BUFFER=$command_text
+  CURSOR=${#BUFFER}
+  [[ $action == rerun ]] && zle accept-line
+}
+
+zle -N seekr-history _seekr_widget
+bindkey '^R' seekr-history
+
 _seekr_preexec() {
   SEEKR_COMMAND=$1
   SEEKR_CWD=$PWD
@@ -235,6 +249,22 @@ SEEKR_GIT_REPO=""
 SEEKR_GIT_BRANCH=""
 SEEKR_LAST_HISTORY=""
 SEEKR_READY=0
+
+_seekr_readline() {
+  local result action command_text
+  result=$(command seekr) || return
+  [[ $result == *$'\n'* ]] || return
+  action=${result%%$'\n'*}
+  command_text=${result#*$'\n'}
+  if [[ $action == rerun ]]; then
+    eval -- "$command_text"
+  else
+    READLINE_LINE=$command_text
+    READLINE_POINT=${#READLINE_LINE}
+  fi
+}
+
+bind -x '"\C-r":_seekr_readline'
 case "$PROMPT_COMMAND" in
   '_seekr_precmd "$?"') SEEKR_PROMPT_COMMAND=${SEEKR_PROMPT_COMMAND:-} ;;
   *) SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND ;;
@@ -829,6 +859,9 @@ mod tests {
         assert!(output.contains("zmodload zsh/datetime"));
         assert!(output.contains("SEEKR_CWD=$PWD"));
         assert!(output.contains("EPOCHREALTIME * 1000"));
+        assert!(output.contains("bindkey '^R' seekr-history"));
+        assert!(output.contains("BUFFER=$command_text"));
+        assert!(output.contains("[[ $action == rerun ]] && zle accept-line"));
         assert_capture_fields(&output, "zsh");
         assert!(output.contains("~/.zshrc"));
         assert_shell_syntax("zsh", &output);
@@ -849,6 +882,9 @@ mod tests {
         assert!(output.contains("SEEKR_PROMPT_COMMAND=$PROMPT_COMMAND"));
         assert!(output.contains("PROMPT_COMMAND='_seekr_precmd \"$?\"'"));
         assert!(output.contains("Seekr must own the DEBUG trap"));
+        assert!(output.contains("bind -x '\"\\C-r\":_seekr_readline'"));
+        assert!(output.contains("READLINE_LINE=$command_text"));
+        assert!(output.contains("eval -- \"$command_text\""));
         assert_capture_fields(&output, "bash");
         assert!(output.contains("~/.bashrc"));
         assert_shell_syntax("bash", &output);

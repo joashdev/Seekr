@@ -1,5 +1,6 @@
 # Seekr MVP Progress
 
+- 2026-07-13 - Task 12: Added distinct TUI actions for clipboard copy, editable shell prompt insertion, and explicit rerun through zsh and bash integrations.
 - 2026-07-12 - Task 13: Implemented comprehensive stats command with database health, command counts, collapse info, and privacy status reporting.
 - 2026-07-12 - Task 11: Added interactive ratatui-based TUI search flow with live filtering, keyboard navigation, and command preview.
 - 2026-07-12 - Task 10: Added duplicate command collapse in search results with repeat count, exit-summary display, FTS-preserving ranking, and context-filter-aware deduplication.
