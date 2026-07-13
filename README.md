@@ -1,23 +1,65 @@
 # Seekr
 
-Seekr is a local-first CLI and TUI for capturing, indexing, and recalling terminal commands.
+Seekr is a local-only CLI and TUI for capturing, indexing, and recalling terminal commands. Commands and configuration stay on this machine; Seekr has no cloud dependency.
 
 It is designed as a smarter `Ctrl-R` for developers, operators, and power users who want command history with richer context than their shell usually keeps: working directory, repository, branch, timestamp, and exit status.
 
+## Setup
+
+Build Seekr and put the binary on your `PATH`:
+
+```bash
+cargo build --release
+mkdir -p "$HOME/.local/bin"
+cp target/release/seekr "$HOME/.local/bin/seekr"
+```
+
+`sk` is the intended short alias. Add the alias and generated hook for your shell to its startup file:
+
+```bash
+# zsh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+echo 'alias sk=seekr' >> ~/.zshrc
+"$HOME/.local/bin/seekr" init zsh >> ~/.zshrc
+source ~/.zshrc
+
+# bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+echo 'alias sk=seekr' >> ~/.bashrc
+"$HOME/.local/bin/seekr" init bash >> ~/.bashrc
+source ~/.bashrc
+```
+
+Import existing zsh history, search from the CLI, or launch the TUI:
+
+```bash
+seekr import ~/.zsh_history
+seekr search docker
+sk
+```
+
+The shell hook captures future commands locally. Privacy redaction is off by default so stored commands remain runnable. To opt in, create the config file shown by your platform's Seekr config directory with:
+
+```toml
+[privacy]
+redaction_enabled = true
+ignore_commands = ["ls", "cd", "pwd", "clear"]
+```
+
 ## MVP Scope
 
-Seekr is currently in planning/bootstrap form. The MVP is scoped around:
+The MVP includes:
 
 - Rust CLI and TUI application.
 - Local SQLite storage through `rusqlite`.
 - SQLite FTS5-backed command search.
-- zsh-first shell capture, with minimal bash support planned.
+- zsh-first shell capture with minimal bash support.
 - Import from `.zsh_history`.
 - Contextual search filters such as current directory, repository, time window, and failed commands.
 - Reuse actions for copying or staging commands back into the shell prompt.
 - Local privacy controls, ignore rules, and optional redaction.
 
-## Planned Command Surface
+## Command Surface
 
 ```bash
 seekr
@@ -28,16 +70,10 @@ seekr import ~/.zsh_history
 seekr stats
 ```
 
-The intended short alias is:
-
-```bash
-sk
-```
-
 ## Product Principles
 
-- Local-first by default.
-- No cloud dependency in the MVP.
+- Local-only storage and operation.
+- No cloud dependency.
 - No AI or natural-language command generation.
 - Raw commands are stored for fast, runnable recall unless optional redaction is enabled.
 - Repeated commands should be collapsed to reduce noise while preserving useful metadata.
@@ -45,6 +81,23 @@ sk
 ## Implementation Plan
 
 The implementation backlog lives in [`tasks/backlog.md`](tasks/backlog.md). Each numbered file in [`tasks/`](tasks/) is written to be executed independently with the `task-runner` skill.
+
+## Smoke Testing
+
+Run the automated smoke coverage from the repository root:
+
+```bash
+./scripts/smoke.sh
+```
+
+The script creates temporary config and data directories and removes them when it exits. It covers history import, capture, search, contextual and failed filters, redaction, stats, and generation of both shell hooks without touching real Seekr data.
+
+For the interactive behavior, use safe commands and check:
+
+1. Launch `sk`; type a known query and verify the result list and preview update.
+2. Press `Alt+C` and verify the raw selected command reaches the clipboard without leaving the TUI.
+3. Press `Enter` and verify the command is inserted/staged at the prompt and remains editable rather than executing.
+4. Press `Alt+R` and verify the visibly labeled explicit rerun action executes the selected safe command.
 
 ## License
 
