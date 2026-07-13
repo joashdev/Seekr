@@ -1,5 +1,6 @@
 # Seekr MVP Progress
 
+- 2026-07-13 - Task 14: Added isolated end-to-end smoke coverage and concise local setup and manual reuse verification documentation.
 - 2026-07-13 - Task 12: Added distinct TUI actions for clipboard copy, editable shell prompt insertion, and explicit rerun through zsh and bash integrations.
 - 2026-07-12 - Task 13: Implemented comprehensive stats command with database health, command counts, collapse info, and privacy status reporting.
 - 2026-07-12 - Task 11: Added interactive ratatui-based TUI search flow with live filtering, keyboard navigation, and command preview.

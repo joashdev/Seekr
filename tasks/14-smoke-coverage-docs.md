@@ -1,6 +1,6 @@
 # 14 - Add End-to-End Smoke Coverage and Setup Documentation
 
-**Status:** [ ]
+**Status:** [x]
 
 **Type:** feat
 
@@ -16,12 +16,12 @@
 - A short manual smoke checklist for TUI rendering, prompt insertion, clipboard behavior, and explicit rerun.
 
 **Acceptance Criteria:**
-- [ ] Automated smoke coverage can run without touching the user's real Seekr data.
-- [ ] Smoke coverage exercises import, capture, search, filters, redaction, and stats.
-- [ ] README setup instructions include zsh and bash hook generation.
-- [ ] README explains the intended `sk` alias.
-- [ ] README states local-only behavior and no cloud dependency.
-- [ ] Manual smoke checklist covers TUI, copy, insert/stage, and explicit rerun behavior.
+- [x] Automated smoke coverage can run without touching the user's real Seekr data.
+- [x] Smoke coverage exercises import, capture, search, filters, redaction, and stats.
+- [x] README setup instructions include zsh and bash hook generation.
+- [x] README explains the intended `sk` alias.
+- [x] README states local-only behavior and no cloud dependency.
+- [x] Manual smoke checklist covers TUI, copy, insert/stage, and explicit rerun behavior.
 
 **Verification Commands:**
 
@@ -29,6 +29,7 @@
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+./scripts/smoke.sh
 SEEKR_CONFIG_DIR=/tmp/seekr-task14-config SEEKR_DATA_DIR=/tmp/seekr-task14-data cargo run -- stats
 SEEKR_CONFIG_DIR=/tmp/seekr-task14-config SEEKR_DATA_DIR=/tmp/seekr-task14-data cargo run -- init zsh
 SEEKR_CONFIG_DIR=/tmp/seekr-task14-config SEEKR_DATA_DIR=/tmp/seekr-task14-data cargo run -- init bash
