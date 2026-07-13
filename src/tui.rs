@@ -41,7 +41,6 @@ impl App {
     pub fn handle_key(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Esc => Action::Quit,
-            KeyCode::Char('q') => Action::Quit,
             KeyCode::Enter => self
                 .results
                 .get(self.selected)
@@ -58,6 +57,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
+                if self.input.is_empty() {
+                    self.set_results(Vec::new());
+                }
                 Action::Continue
             }
             KeyCode::Char(c) => {
@@ -97,18 +99,18 @@ fn run_loop(
 
     loop {
         if needs_query {
-            match db::filtered_collapsed_records(
-                connection,
-                if app.input.is_empty() {
-                    None
-                } else {
-                    Some(&app.input)
-                },
-                &db::SearchFilters::default(),
-                RESULT_LIMIT,
-            ) {
-                Ok(results) => app.set_results(results),
-                Err(e) => app.error = Some(format!("Search error: {e}")),
+            if app.input.is_empty() {
+                app.set_results(Vec::new());
+            } else {
+                match db::filtered_collapsed_records(
+                    connection,
+                    Some(&app.input),
+                    &db::SearchFilters::default(),
+                    RESULT_LIMIT,
+                ) {
+                    Ok(results) => app.set_results(results),
+                    Err(e) => app.error = Some(format!("Search error: {e}")),
+                }
             }
             needs_query = false;
         }
@@ -182,10 +184,14 @@ fn render_search_bar(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_results(frame: &mut Frame, area: Rect, app: &App) {
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let start = visible_result_start(app.selected, visible_rows);
     let items: Vec<ListItem> = app
         .results
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible_rows)
         .map(|(i, record)| {
             let is_selected = i == app.selected;
             let prefix = if is_selected { "> " } else { "  " };
@@ -217,6 +223,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
             .title(format!("Results ({})", app.results.len())),
     );
     frame.render_widget(list, area);
+}
+
+fn visible_result_start(selected: usize, visible_rows: usize) -> usize {
+    selected.saturating_sub(visible_rows.saturating_sub(1))
 }
 
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
@@ -290,6 +300,26 @@ mod tests {
         let mut app = App::default();
         app.handle_key(KeyCode::Backspace);
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn clearing_input_clears_hidden_results() {
+        let mut app = App {
+            input: "a".into(),
+            results: vec![record("cargo test")],
+            ..App::default()
+        };
+
+        app.handle_key(KeyCode::Backspace);
+
+        assert!(app.results.is_empty());
+        assert!(matches!(app.handle_key(KeyCode::Enter), Action::Continue));
+    }
+
+    #[test]
+    fn result_window_keeps_selection_visible() {
+        assert_eq!(visible_result_start(2, 5), 0);
+        assert_eq!(visible_result_start(7, 5), 3);
     }
 
     #[test]
@@ -371,12 +401,13 @@ mod tests {
     }
 
     #[test]
-    fn q_quits() {
+    fn q_is_typed() {
         let mut app = App::default();
-        match app.handle_key(KeyCode::Char('q')) {
-            Action::Quit => {}
-            _ => panic!("expected Quit"),
-        }
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('q')),
+            Action::Continue
+        ));
+        assert_eq!(app.input, "q");
     }
 
     #[test]
@@ -420,5 +451,19 @@ mod tests {
             branch: None,
         }]);
         assert_eq!(app.selected, 0);
+    }
+
+    fn record(command_text: &str) -> db::CollapsedRecord {
+        db::CollapsedRecord {
+            command_text: command_text.into(),
+            normalized_text: command_text.into(),
+            repeat_count: 1,
+            most_recent_executed_at: 1,
+            most_recent_cwd: "/tmp".into(),
+            most_recent_exit_code: 0,
+            all_same_exit: true,
+            repo: None,
+            branch: None,
+        }
     }
 }
