@@ -17,6 +17,38 @@ const CLI_ABOUT: &str =
 const CLI_AFTER_HELP: &str =
     "The generated zsh integration installs `sk` and Ctrl-R command recall.";
 
+pub(crate) fn format_relative_timestamp(executed_at: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(i64::MAX, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        });
+    format_relative_timestamp_at(executed_at, now)
+}
+
+fn format_relative_timestamp_at(executed_at: i64, now: i64) -> String {
+    let seconds = executed_at.abs_diff(now);
+    if seconds < 60 {
+        return "just now".to_string();
+    }
+
+    let (value, unit) = if seconds < 60 * 60 {
+        (seconds / 60, "m")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "h")
+    } else if seconds < 7 * 24 * 60 * 60 {
+        (seconds / (24 * 60 * 60), "d")
+    } else {
+        (seconds / (7 * 24 * 60 * 60), "w")
+    };
+
+    if executed_at > now {
+        format!("in {value}{unit}")
+    } else {
+        format!("{value}{unit} ago")
+    }
+}
+
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "seekr",
@@ -472,8 +504,11 @@ fn render_collapsed_records(
                 format!("mixed (most recent: {})", record.most_recent_exit_code)
             };
             let mut metadata = format!(
-                "  cwd: {} | timestamp: {} | exit: {}{}",
-                record.most_recent_cwd, record.most_recent_executed_at, exit, repeat
+                "  cwd: {} | last used: {} | exit: {}{}",
+                record.most_recent_cwd,
+                format_relative_timestamp(record.most_recent_executed_at),
+                exit,
+                repeat
             );
             if let Some(repo) = &record.repo {
                 metadata.push_str(&format!(" | repo: {repo}"));
@@ -893,6 +928,27 @@ mod tests {
         assert!(!help
             .lines()
             .any(|line| line.trim_start().starts_with("capture")));
+    }
+
+    #[test]
+    fn formats_command_timestamps_for_people() {
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000, 1_000),
+            "just now"
+        );
+        assert_eq!(super::format_relative_timestamp_at(940, 1_000), "1m ago");
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 - 3 * 60 * 60, 1_000),
+            "3h ago"
+        );
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 - 2 * 24 * 60 * 60, 1_000),
+            "2d ago"
+        );
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 + 5 * 60, 1_000),
+            "in 5m"
+        );
     }
 
     #[test]
@@ -1491,7 +1547,8 @@ _seekr_rerun 'printf rerun-marker'
 
         assert!(output.contains("docker compose up && cargo test"));
         assert!(output.contains("cwd: /tmp/project"));
-        assert!(output.contains("timestamp: 1720000000"));
+        assert!(output.contains("last used:"));
+        assert!(!output.contains("timestamp:"));
         assert!(output.contains("exit: 0"));
         assert!(output.contains("repo: seekr"));
         assert!(output.contains("branch: main"));
@@ -2003,7 +2060,8 @@ _seekr_rerun 'printf rerun-marker'
         assert!(output.contains("repeats: 3"));
         assert!(output.contains("exit: mixed (most recent: 1)"));
         assert!(output.contains("cwd: /tmp/project"));
-        assert!(output.contains("timestamp: 1720000002"));
+        assert!(output.contains("last used:"));
+        assert!(!output.contains("timestamp:"));
     }
 
     #[test]

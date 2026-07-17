@@ -1,4 +1,4 @@
-use crate::{config, db};
+use crate::{config, db, format_relative_timestamp};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -323,8 +323,11 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut meta = format!(
-        "cwd: {} | timestamp: {} | exit: {}{}",
-        record.most_recent_cwd, record.most_recent_executed_at, exit, repeat
+        "cwd: {} | last used: {} | exit: {}{}",
+        record.most_recent_cwd,
+        format_relative_timestamp(record.most_recent_executed_at),
+        exit,
+        repeat
     );
     if let Some(repo) = &record.repo {
         meta.push_str(&format!(" | repo: {repo}"));
