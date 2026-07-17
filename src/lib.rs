@@ -209,6 +209,10 @@ bindkey '^R' seekr-history
 
 unalias sk 2>/dev/null
 sk() {
+  if (( $# )); then
+    command seekr "$@"
+    return
+  fi
   local -a reply
   local action command_text
   _seekr_select || return
@@ -973,6 +977,43 @@ print -rn -- "$staged"
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), selected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_forwards_cli_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk-args");
+        let seekr = root.join("seekr");
+        fs::write(&seekr, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let output = ProcessCommand::new("zsh")
+            .args(["-fc", "eval \"$SEEKR_TEST_HOOK\"; sk --version"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .output()
+            .expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "<--version>\n");
     }
 
     #[test]
