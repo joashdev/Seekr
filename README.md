@@ -14,12 +14,11 @@ mkdir -p "$HOME/.local/bin"
 cp target/release/seekr "$HOME/.local/bin/seekr"
 ```
 
-`sk` is the intended short alias. Add the alias and generated hook for your shell to its startup file:
+Add the generated hook for your shell to its startup file:
 
 ```bash
 # zsh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-echo 'alias sk=seekr' >> ~/.zshrc
 "$HOME/.local/bin/seekr" init zsh >> ~/.zshrc
 source ~/.zshrc
 
@@ -30,13 +29,21 @@ echo 'alias sk=seekr' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-Import existing zsh history, search from the CLI, or launch the TUI:
+The zsh hook installs both `Ctrl-R` and an `sk` function. `sk` consumes Seekr's
+selection protocol and puts an inserted command onto zsh's editable command
+line. Do not replace that function with an alias. Under bash, the `sk` alias is
+a shorthand for CLI subcommands such as `sk search`; launch interactive recall
+with `Ctrl-R`, which can stage the selection in bash's editable command line.
+
+Import existing zsh history or search from the CLI:
 
 ```bash
 seekr import ~/.zsh_history
 seekr search docker
-sk
 ```
+
+On zsh, run `sk` to launch interactive recall. On bash, press `Ctrl-R` at the
+editable prompt; the `sk` alias is for CLI subcommands.
 
 The shell hook captures future commands locally. Privacy redaction is off by default so stored commands remain runnable. To opt in, create the config file shown by your platform's Seekr config directory with:
 
@@ -95,9 +102,9 @@ The script creates temporary config and data directories and removes them when i
 For the interactive behavior, use safe commands and check:
 
 1. Launch `sk`; type a known query and verify the result list and preview update.
-2. Press `Alt+C` and verify the raw selected command reaches the clipboard without leaving the TUI.
+2. Press `Ctrl+Y` and verify the raw selected command reaches the clipboard without leaving the TUI.
 3. Press `Enter` and verify the command is inserted/staged at the prompt and remains editable rather than executing.
-4. Press `Alt+R` and verify the visibly labeled explicit rerun action executes the selected safe command.
+4. Press `F5` and verify the visibly labeled explicit rerun action executes the selected safe command.
 
 ## Releasing
 
@@ -106,8 +113,8 @@ CI runs formatting, Clippy, tests, and the smoke script on pushes and pull reque
 Only a repository administrator can create a release tag. To release, update the version in `Cargo.toml`, merge it to `main`, then push the matching tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The release workflow builds a Linux x86_64 archive, waits for approval from the protected `release` environment, and publishes the archive with signed SLSA provenance. Published releases and their tags are immutable.
@@ -115,8 +122,8 @@ The release workflow builds a Linux x86_64 archive, waits for approval from the 
 Verify a downloaded release and its assets with the GitHub CLI:
 
 ```bash
-gh release verify v0.1.0 --repo joashdev/Seekr
-gh release verify-asset v0.1.0 seekr-v0.1.0-x86_64-unknown-linux-gnu.tar.gz --repo joashdev/Seekr
+gh release verify v0.1.1 --repo joashdev/Seekr
+gh release verify-asset v0.1.1 seekr-v0.1.1-x86_64-unknown-linux-gnu.tar.gz --repo joashdev/Seekr
 ```
 
 ## License

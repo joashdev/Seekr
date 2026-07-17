@@ -1,4 +1,4 @@
-use crate::{config, db};
+use crate::{config, db, format_relative_timestamp};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -16,6 +16,7 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 const RESULT_LIMIT: usize = 20;
+const RECENT_LIMIT: usize = 10;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -52,12 +53,10 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Action::Quit,
             (KeyCode::Enter, _) => selected().map_or(Action::Continue, Action::Insert),
-            (KeyCode::Char('c'), KeyModifiers::ALT) => {
+            (KeyCode::Char('y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 selected().map_or(Action::Continue, Action::Copy)
             }
-            (KeyCode::Char('r'), KeyModifiers::ALT) => {
-                selected().map_or(Action::Continue, Action::Rerun)
-            }
+            (KeyCode::F(5), _) => selected().map_or(Action::Continue, Action::Rerun),
             (KeyCode::Up, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 Action::Continue
@@ -70,9 +69,6 @@ impl App {
             }
             (KeyCode::Backspace, _) => {
                 self.input.pop();
-                if self.input.is_empty() {
-                    self.set_results(Vec::new());
-                }
                 Action::Continue
             }
             (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
@@ -108,23 +104,12 @@ fn run_loop(
     connection: &rusqlite::Connection,
 ) -> io::Result<String> {
     let mut app = App::default();
+    refresh_results(&mut app, connection);
     let mut needs_query = false;
 
     loop {
         if needs_query {
-            if app.input.is_empty() {
-                app.set_results(Vec::new());
-            } else {
-                match db::filtered_collapsed_records(
-                    connection,
-                    Some(&app.input),
-                    &db::SearchFilters::default(),
-                    RESULT_LIMIT,
-                ) {
-                    Ok(results) => app.set_results(results),
-                    Err(e) => app.error = Some(format!("Search error: {e}")),
-                }
-            }
+            refresh_results(&mut app, connection);
             needs_query = false;
         }
 
@@ -156,6 +141,23 @@ fn run_loop(
                 }
             }
         }
+    }
+}
+
+fn refresh_results(app: &mut App, connection: &rusqlite::Connection) {
+    let results = if app.input.is_empty() {
+        db::recent_collapsed_records(connection, &db::SearchFilters::default(), RECENT_LIMIT)
+    } else {
+        db::fuzzy_filtered_collapsed_records(
+            connection,
+            &app.input,
+            &db::SearchFilters::default(),
+            RESULT_LIMIT,
+        )
+    };
+    match results {
+        Ok(results) => app.set_results(results),
+        Err(error) => app.error = Some(format!("Search error: {error}")),
     }
 }
 
@@ -226,11 +228,15 @@ fn render(frame: &mut Frame, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title("Error")),
             chunks[1],
         );
-    } else if app.input.is_empty() {
+    } else if app.results.is_empty() {
         frame.render_widget(
-            Paragraph::new("Type to search...")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(Block::default().borders(Borders::ALL).title("Results")),
+            Paragraph::new(if app.input.is_empty() {
+                "No command history yet — type to search after running commands."
+            } else {
+                "No matching commands."
+            })
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title("Results")),
             chunks[1],
         );
     } else {
@@ -284,11 +290,12 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Results ({})", app.results.len())),
-    );
+    let title = if app.input.is_empty() {
+        format!("Recent commands ({}) — type to search", app.results.len())
+    } else {
+        format!("Results ({})", app.results.len())
+    };
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, area);
 }
 
@@ -311,8 +318,11 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut meta = format!(
-        "cwd: {} | timestamp: {} | exit: {}{}",
-        record.most_recent_cwd, record.most_recent_executed_at, exit, repeat
+        "cwd: {} | last used: {} | exit: {}{}",
+        record.most_recent_cwd,
+        format_relative_timestamp(record.most_recent_executed_at),
+        exit,
+        repeat
     );
     if let Some(repo) = &record.repo {
         meta.push_str(&format!(" | repo: {repo}"));
@@ -333,7 +343,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Green),
         )]),
         Line::from(vec![Span::styled(meta, Style::default().fg(Color::Gray))]),
-        Line::from("[Enter] Insert/edit  [Alt+C] Copy  [Alt+R] Rerun (executes)"),
+        Line::from("[Enter] Insert/edit  [Ctrl+Y] Copy  [F5] Rerun (executes)"),
         Line::from(app.status.as_deref().unwrap_or("")),
     ];
 
@@ -345,6 +355,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -376,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_input_clears_hidden_results() {
+    fn clearing_input_keeps_results_until_the_next_refresh() {
         let mut app = App {
             input: "a".into(),
             results: vec![record("cargo test")],
@@ -385,11 +396,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Backspace));
 
-        assert!(app.results.is_empty());
-        assert!(matches!(
-            app.handle_key(key(KeyCode::Enter)),
-            Action::Continue
-        ));
+        assert_eq!(app.results.len(), 1);
     }
 
     #[test]
@@ -535,13 +542,59 @@ mod tests {
         app.set_results(vec![record("cargo   test -- --exact")]);
 
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)),
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
             Action::Copy("cargo   test -- --exact".into())
         );
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Action::Rerun("cargo   test -- --exact".into())
         );
+    }
+
+    #[test]
+    fn terminal_portable_shortcuts_avoid_line_editing_collisions() {
+        let mut app = App::default();
+        app.set_results(vec![record("cargo test")]);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            Action::Copy("cargo test".into())
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            Action::Rerun("cargo test".into())
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Action::Continue
+        );
+    }
+
+    #[test]
+    fn empty_search_shows_recent_commands_and_hint() {
+        let app = App {
+            results: vec![record("docker compose up")],
+            ..App::default()
+        };
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("docker compose up"));
+        assert!(rendered.contains("Recent commands"));
+        assert!(rendered.contains("type to search"));
     }
 
     #[test]

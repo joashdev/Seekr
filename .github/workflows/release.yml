@@ -113,4 +113,4 @@ jobs:
           --draft=false
           --latest
           --title "Seekr $GITHUB_REF_NAME"
-          --notes "Initial Seekr MVP release. See the README for installation and usage."
+          --notes "Fuzzy recall, editable zsh insertion, reliable macOS controls, recent-command empty state, and human-readable recency."

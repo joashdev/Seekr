@@ -15,7 +15,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CLI_ABOUT: &str =
     "Seekr is a local-first CLI and future TUI for recalling terminal commands.";
 const CLI_AFTER_HELP: &str =
-    "Planned alias: sk\n\nRunning `seekr` with no subcommand is reserved for the future TUI.";
+    "The generated zsh integration installs `sk` and Ctrl-R command recall.";
+
+pub(crate) fn format_relative_timestamp(executed_at: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(i64::MAX, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        });
+    format_relative_timestamp_at(executed_at, now)
+}
+
+fn format_relative_timestamp_at(executed_at: i64, now: i64) -> String {
+    let seconds = executed_at.abs_diff(now);
+    if seconds < 60 {
+        return "just now".to_string();
+    }
+
+    let (value, unit) = if seconds < 60 * 60 {
+        (seconds / 60, "m")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "h")
+    } else if seconds < 7 * 24 * 60 * 60 {
+        (seconds / (24 * 60 * 60), "d")
+    } else {
+        (seconds / (7 * 24 * 60 * 60), "w")
+    };
+
+    if executed_at > now {
+        format!("in {value}{unit}")
+    } else {
+        format!("{value}{unit} ago")
+    }
+}
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -184,12 +216,21 @@ typeset -g SEEKR_HOSTNAME=""
 typeset -g SEEKR_GIT_REPO=""
 typeset -g SEEKR_GIT_BRANCH=""
 
-_seekr_widget() {
+_seekr_select() {
   local result action command_text
   result=$(command seekr) || return
   [[ $result == *$'\n'* ]] || return
   action=${result%%$'\n'*}
   command_text=${result#*$'\n'}
+  reply=("$action" "$command_text")
+}
+
+_seekr_widget() {
+  local -a reply
+  local action command_text
+  _seekr_select || return
+  action=${reply[1]}
+  command_text=${reply[2]}
   BUFFER=$command_text
   CURSOR=${#BUFFER}
   [[ $action == rerun ]] && zle accept-line
@@ -197,6 +238,26 @@ _seekr_widget() {
 
 zle -N seekr-history _seekr_widget
 bindkey '^R' seekr-history
+
+unalias sk 2>/dev/null
+sk() {
+  SEEKR_COMMAND=""
+  if (( $# )); then
+    command seekr "$@"
+    return
+  fi
+  local -a reply
+  local action command_text
+  _seekr_select || return
+  action=${reply[1]}
+  command_text=${reply[2]}
+  if [[ $action == rerun ]]; then
+    _seekr_preexec "$command_text"
+    builtin eval -- "$command_text"
+  else
+    print -rz -- "$command_text"
+  fi
+}
 
 _seekr_preexec() {
   SEEKR_COMMAND=$1
@@ -445,8 +506,11 @@ fn render_collapsed_records(
                 format!("mixed (most recent: {})", record.most_recent_exit_code)
             };
             let mut metadata = format!(
-                "  cwd: {} | timestamp: {} | exit: {}{}",
-                record.most_recent_cwd, record.most_recent_executed_at, exit, repeat
+                "  cwd: {} | last used: {} | exit: {}{}",
+                record.most_recent_cwd,
+                format_relative_timestamp(record.most_recent_executed_at),
+                exit,
+                repeat
             );
             if let Some(repo) = &record.repo {
                 metadata.push_str(&format!(" | repo: {repo}"));
@@ -846,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn includes_planned_alias_in_help() {
+    fn includes_zsh_integration_in_help() {
         let mut command = Cli::command();
         let mut help = Vec::new();
 
@@ -856,7 +920,7 @@ mod tests {
 
         let help = String::from_utf8(help).expect("help should be utf8");
 
-        assert!(help.contains("Planned alias: sk"));
+        assert!(help.contains("generated zsh integration"));
         assert!(help.contains("search"));
         assert!(help.contains("here"));
         assert!(help.contains("failed"));
@@ -866,6 +930,27 @@ mod tests {
         assert!(!help
             .lines()
             .any(|line| line.trim_start().starts_with("capture")));
+    }
+
+    #[test]
+    fn formats_command_timestamps_for_people() {
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000, 1_000),
+            "just now"
+        );
+        assert_eq!(super::format_relative_timestamp_at(940, 1_000), "1m ago");
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 - 3 * 60 * 60, 1_000),
+            "3h ago"
+        );
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 - 2 * 24 * 60 * 60, 1_000),
+            "2d ago"
+        );
+        assert_eq!(
+            super::format_relative_timestamp_at(1_000 + 5 * 60, 1_000),
+            "in 5m"
+        );
     }
 
     #[test]
@@ -883,11 +968,209 @@ mod tests {
         assert!(output.contains("SEEKR_CWD=$PWD"));
         assert!(output.contains("EPOCHREALTIME * 1000"));
         assert!(output.contains("bindkey '^R' seekr-history"));
+        assert!(output.contains("sk()"));
+        assert!(output.contains("print -rz -- \"$command_text\""));
         assert!(output.contains("BUFFER=$command_text"));
         assert!(output.contains("[[ $action == rerun ]] && zle accept-line"));
         assert_capture_fields(&output, "zsh");
         assert!(output.contains("~/.zshrc"));
         assert_shell_syntax("zsh", &output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_stages_raw_multiline_commands_without_printing_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk");
+        let seekr = root.join("seekr");
+        let selection = root.join("selection");
+        let selected = "printf '%s\\n' \\\n  'hello world'";
+        fs::write(
+            &seekr,
+            "#!/bin/sh\nprintf 'insert\\n'\ncat \"$SEEKR_TEST_SELECTION\"\n",
+        )
+        .expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+        fs::write(&selection, selected).expect("selection fixture should write");
+
+        let input = r#"eval "$SEEKR_TEST_HOOK"
+sk
+read -rz staged
+print -rn -- "$staged"
+"#;
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let mut child = ProcessCommand::new("zsh")
+            .args(["-f"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_SELECTION", &selection)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("zsh should start");
+        child
+            .stdin
+            .take()
+            .expect("zsh stdin")
+            .write_all(input.as_bytes())
+            .expect("zsh input should write");
+        let output = child.wait_with_output().expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), selected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_captures_selected_commands_instead_of_the_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk-capture");
+        let seekr = root.join("seekr");
+        let insert_selection = root.join("insert-selection");
+        let rerun_selection = root.join("rerun-selection");
+        let captures = root.join("captures");
+        let insert_command = "printf '%s\\n' \\\n  'insert marker'";
+        let rerun_command = "printf '%s\\n' \\\n  'rerun marker'\nreturn 7";
+        fs::write(
+            &seekr,
+            r#"#!/bin/sh
+if [ "$1" = capture ]; then
+  shift
+  printf 'CAPTURE\n' >> "$SEEKR_TEST_CAPTURES"
+  printf 'ARG=<%s>\n' "$@" >> "$SEEKR_TEST_CAPTURES"
+  exit 0
+fi
+printf '%s\n' "$SEEKR_TEST_ACTION"
+cat "$SEEKR_TEST_SELECTION"
+"#,
+        )
+        .expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+        fs::write(&insert_selection, insert_command).expect("insert fixture should write");
+        fs::write(&rerun_selection, rerun_command).expect("rerun fixture should write");
+
+        let input = r#"eval "$SEEKR_TEST_HOOK"
+preexec_functions=()
+export SEEKR_TEST_ACTION=insert
+export SEEKR_TEST_SELECTION="$SEEKR_TEST_INSERT_SELECTION"
+_seekr_preexec sk
+sk
+insert_status=$?
+(exit "$insert_status")
+_seekr_precmd
+read -rz staged
+print -r -- "INSERT_STATUS=$insert_status"
+print -r -- "STAGED=$staged"
+export SEEKR_TEST_ACTION=rerun
+export SEEKR_TEST_SELECTION="$SEEKR_TEST_RERUN_SELECTION"
+_seekr_preexec sk
+sk
+rerun_status=$?
+(exit "$rerun_status")
+_seekr_precmd
+print -r -- "RERUN_STATUS=$rerun_status"
+"#;
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let mut child = ProcessCommand::new("zsh")
+            .args(["-f"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_INSERT_SELECTION", &insert_selection)
+            .env("SEEKR_TEST_RERUN_SELECTION", &rerun_selection)
+            .env("SEEKR_TEST_CAPTURES", &captures)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("zsh should start");
+        child
+            .stdin
+            .take()
+            .expect("zsh stdin")
+            .write_all(input.as_bytes())
+            .expect("zsh input should write");
+        let output = child.wait_with_output().expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("INSERT_STATUS=0\nSTAGED={insert_command}\nrerun marker\nRERUN_STATUS=7\n")
+        );
+        let captures = fs::read_to_string(captures).expect("rerun should be captured");
+        assert_eq!(captures.matches("CAPTURE\n").count(), 1);
+        assert!(captures.contains(&format!("ARG=<--command-text>\nARG=<{rerun_command}>\n")));
+        assert!(captures.contains("ARG=<--exit-code>\nARG=<7>\n"));
+        assert!(!captures.contains("ARG=<sk>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_forwards_cli_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk-args");
+        let seekr = root.join("seekr");
+        fs::write(&seekr, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let output = ProcessCommand::new("zsh")
+            .args(["-fc", "eval \"$SEEKR_TEST_HOOK\"; sk --version"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .output()
+            .expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "<--version>\n");
     }
 
     #[test]
@@ -1365,7 +1648,8 @@ _seekr_rerun 'printf rerun-marker'
 
         assert!(output.contains("docker compose up && cargo test"));
         assert!(output.contains("cwd: /tmp/project"));
-        assert!(output.contains("timestamp: 1720000000"));
+        assert!(output.contains("last used:"));
+        assert!(!output.contains("timestamp:"));
         assert!(output.contains("exit: 0"));
         assert!(output.contains("repo: seekr"));
         assert!(output.contains("branch: main"));
@@ -1877,7 +2161,8 @@ _seekr_rerun 'printf rerun-marker'
         assert!(output.contains("repeats: 3"));
         assert!(output.contains("exit: mixed (most recent: 1)"));
         assert!(output.contains("cwd: /tmp/project"));
-        assert!(output.contains("timestamp: 1720000002"));
+        assert!(output.contains("last used:"));
+        assert!(!output.contains("timestamp:"));
     }
 
     #[test]
