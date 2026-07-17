@@ -146,12 +146,7 @@ fn run_loop(
 
 fn refresh_results(app: &mut App, connection: &rusqlite::Connection) {
     let results = if app.input.is_empty() {
-        db::filtered_collapsed_records(
-            connection,
-            None,
-            &db::SearchFilters::default(),
-            RECENT_LIMIT,
-        )
+        db::recent_collapsed_records(connection, &db::SearchFilters::default(), RECENT_LIMIT)
     } else {
         db::fuzzy_filtered_collapsed_records(
             connection,

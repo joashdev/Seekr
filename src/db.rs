@@ -5,6 +5,9 @@ use std::io;
 use std::path::Path;
 
 pub const SCHEMA_VERSION: i64 = 1;
+const FUZZY_CANDIDATE_LIMIT: usize = 100;
+const FUZZY_SCAN_LIMIT: usize = 1_000;
+const RECENT_RAW_CANDIDATE_LIMIT: usize = 100;
 const MIGRATION_001: &str = "
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY,
@@ -273,7 +276,7 @@ pub fn filtered_command_records(
     filters: &SearchFilters,
     limit: usize,
 ) -> io::Result<Vec<CommandRecord>> {
-    filtered_command_records_with_limit(connection, query, filters, Some(limit))
+    filtered_command_records_with_limit(connection, query, filters, Some(limit), 0, false, false)
 }
 
 fn filtered_command_records_with_limit(
@@ -281,6 +284,9 @@ fn filtered_command_records_with_limit(
     query: Option<&str>,
     filters: &SearchFilters,
     limit: Option<usize>,
+    offset: usize,
+    prefix_query: bool,
+    distinct_groups: bool,
 ) -> io::Result<Vec<CommandRecord>> {
     let limit = limit
         .map(|limit| {
@@ -312,7 +318,13 @@ fn filtered_command_records_with_limit(
         .map(|query| {
             query
                 .split_whitespace()
-                .map(|term| format!("\"{term}\""))
+                .map(|term| {
+                    if prefix_query {
+                        format!("\"{term}\"*")
+                    } else {
+                        format!("\"{term}\"")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         });
@@ -321,19 +333,24 @@ fn filtered_command_records_with_limit(
     }
     let has_query = query.is_some();
 
-    let mut sql = String::from(
+    let executed_at = if distinct_groups {
+        "MAX(commands.executed_at)"
+    } else {
+        "commands.executed_at"
+    };
+    let mut sql = format!(
         "SELECT
             commands.command_text,
             commands.normalized_text,
             commands.cwd,
-            commands.executed_at,
+            {executed_at},
             commands.exit_code,
             commands.shell,
             commands.duration_ms,
             commands.hostname,
             commands.git_repo,
             commands.git_branch
-         FROM ",
+         FROM "
     );
     if has_query {
         sql.push_str("commands_fts JOIN commands ON commands.id = commands_fts.rowid");
@@ -376,14 +393,28 @@ fn filtered_command_records_with_limit(
         sql.push_str(" WHERE ");
         sql.push_str(&clauses.join(" AND "));
     }
-    sql.push_str(if has_query {
-        " ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC"
+    if distinct_groups {
+        sql.push_str(
+            " GROUP BY
+                commands.normalized_text,
+                commands.cwd,
+                commands.git_repo,
+                commands.git_branch",
+        );
+    }
+    sql.push_str(if distinct_groups {
+        " ORDER BY MAX(commands.executed_at) DESC"
+    } else if prefix_query {
+        " ORDER BY commands_fts.rowid DESC"
+    } else if has_query {
+        " ORDER BY commands_fts.rank, commands.executed_at DESC, commands.id DESC"
     } else {
         " ORDER BY commands.executed_at DESC, commands.id DESC"
     });
     if let Some(limit) = limit {
-        sql.push_str(" LIMIT ?");
+        sql.push_str(" LIMIT ? OFFSET ?");
         values.push(Value::Integer(limit));
+        values.push(Value::Integer(offset as i64));
     }
 
     let mut statement = connection.prepare(&sql).map_err(io::Error::other)?;
@@ -424,6 +455,39 @@ pub fn filtered_collapsed_records(
     Ok(collapse_records(records))
 }
 
+pub fn recent_collapsed_records(
+    connection: &Connection,
+    filters: &SearchFilters,
+    limit: usize,
+) -> io::Result<Vec<CollapsedRecord>> {
+    if !(1..=100).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "limit must be between 1 and 100",
+        ));
+    }
+
+    let mut records =
+        filtered_command_records(connection, None, filters, RECENT_RAW_CANDIDATE_LIMIT)?;
+    if collapse_records(records.clone()).len() < limit {
+        append_missing_groups(
+            &mut records,
+            filtered_command_records_with_limit(
+                connection,
+                None,
+                filters,
+                Some(limit),
+                0,
+                false,
+                true,
+            )?,
+        );
+    }
+    let mut collapsed = collapse_records(records);
+    collapsed.truncate(limit);
+    Ok(collapsed)
+}
+
 pub fn fuzzy_filtered_collapsed_records(
     connection: &Connection,
     query: &str,
@@ -442,7 +506,7 @@ pub fn fuzzy_filtered_collapsed_records(
         return Ok(Vec::new());
     }
 
-    let records = filtered_command_records_with_limit(connection, None, filters, None)?;
+    let records = fuzzy_candidate_records(connection, &query, filters, limit)?;
     let mut scored = collapse_records(records)
         .into_iter()
         .filter_map(|record| {
@@ -453,6 +517,65 @@ pub fn fuzzy_filtered_collapsed_records(
     scored.truncate(limit);
 
     Ok(scored.into_iter().map(|(_, record)| record).collect())
+}
+
+fn fuzzy_candidate_records(
+    connection: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    desired_limit: usize,
+) -> io::Result<Vec<CommandRecord>> {
+    // ponytail: typo/subsequence matching is limited to recent commands; indexed
+    // FTS prefix candidates keep older correctly-spelled commands discoverable.
+    // Add a trigram index only if old typo recall proves worth a schema migration.
+    let mut records = filtered_command_records_with_limit(
+        connection,
+        None,
+        filters,
+        Some(FUZZY_CANDIDATE_LIMIT),
+        0,
+        false,
+        false,
+    )?;
+    for offset in (0..FUZZY_SCAN_LIMIT).step_by(FUZZY_CANDIDATE_LIMIT) {
+        let exact_candidates = filtered_command_records_with_limit(
+            connection,
+            Some(query),
+            filters,
+            Some(FUZZY_CANDIDATE_LIMIT),
+            offset,
+            true,
+            false,
+        )?;
+        let page_is_full = exact_candidates.len() == FUZZY_CANDIDATE_LIMIT;
+        append_missing_groups(&mut records, exact_candidates);
+        let match_count = collapse_records(records.clone())
+            .iter()
+            .filter(|record| fuzzy_score(query, &record.normalized_text).is_some())
+            .count();
+        if match_count >= desired_limit || !page_is_full {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+fn append_missing_groups(records: &mut Vec<CommandRecord>, candidates: Vec<CommandRecord>) {
+    for candidate in candidates {
+        if !records
+            .iter()
+            .any(|record| same_collapse_group(record, &candidate))
+        {
+            records.push(candidate);
+        }
+    }
+}
+
+fn same_collapse_group(left: &CommandRecord, right: &CommandRecord) -> bool {
+    left.normalized_text == right.normalized_text
+        && left.cwd == right.cwd
+        && left.git_repo == right.git_repo
+        && left.git_branch == right.git_branch
 }
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
@@ -482,8 +605,31 @@ fn fuzzy_term_score(term: &str, word: &str) -> Option<usize> {
         return Some(score);
     }
 
+    if is_adjacent_transposition(term, word) {
+        return Some(110);
+    }
+
     let distance = edit_distance(term, word);
     (distance <= (term_len / 3).max(1)).then_some(100 + distance * 10)
+}
+
+fn is_adjacent_transposition(left: &str, right: &str) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mismatches = left
+        .iter()
+        .zip(&right)
+        .enumerate()
+        .filter_map(|(index, (left, right))| (left != right).then_some(index))
+        .collect::<Vec<_>>();
+    matches!(mismatches.as_slice(), [first, second]
+        if *second == *first + 1
+            && left[*first] == right[*second]
+            && left[*second] == right[*first])
 }
 
 fn subsequence_score(term: &str, word: &str) -> Option<usize> {
@@ -597,7 +743,8 @@ fn normalize_command_text(command_text: &str) -> String {
 mod tests {
     use super::{
         filtered_command_records, fuzzy_filtered_collapsed_records, insert_command_record, open,
-        recent_command_records, search_command_records, CommandRecord, SearchFilters,
+        recent_collapsed_records, recent_command_records, search_command_records, CommandRecord,
+        SearchFilters,
     };
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
@@ -779,6 +926,7 @@ mod tests {
         let connection = open(&root.join("seekr.db")).expect("database should initialize");
 
         for (command_text, executed_at) in [
+            ("git status", 5),
             ("cargo docker", 4),
             ("cargo test", 3),
             ("docker compose up", 2),
@@ -828,6 +976,16 @@ mod tests {
             Some("docker compose up")
         );
 
+        let short_transposition =
+            fuzzy_filtered_collapsed_records(&connection, "gti", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+        assert_eq!(
+            short_transposition
+                .first()
+                .map(|record| record.command_text.as_str()),
+            Some("git status")
+        );
+
         assert!(
             fuzzy_filtered_collapsed_records(&connection, "x", &SearchFilters::default(), 10)
                 .expect("fuzzy search should succeed")
@@ -862,7 +1020,21 @@ mod tests {
         .expect("record should validate");
         insert_command_record(&connection, &old_match).expect("record should insert");
 
-        for executed_at in 2..=102 {
+        let crowded_out_match = CommandRecord::new(
+            "cargo build".to_string(),
+            "/tmp/project".to_string(),
+            2,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &crowded_out_match).expect("record should insert");
+
+        for executed_at in 3..=103 {
             let duplicate = CommandRecord::new(
                 "cargo test".to_string(),
                 "/tmp/project".to_string(),
@@ -886,6 +1058,136 @@ mod tests {
             results.first().map(|record| record.command_text.as_str()),
             Some("docker compose up")
         );
+
+        let crowded_results =
+            fuzzy_filtered_collapsed_records(&connection, "cargo", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+        assert_eq!(
+            crowded_results
+                .iter()
+                .map(|record| record.command_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cargo test", "cargo build"]
+        );
+    }
+
+    #[test]
+    fn fuzzy_tui_search_prefers_old_exact_match_over_recent_typos() {
+        let root = temp_root("db-fuzzy-exact-over-recent-typos");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        let exact = CommandRecord::new(
+            "git status".to_string(),
+            "/tmp/project".to_string(),
+            1,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &exact).expect("record should insert");
+
+        for executed_at in 2..=102 {
+            let typo = CommandRecord::new(
+                format!("gist command {executed_at}"),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &typo).expect("record should insert");
+        }
+
+        let results =
+            fuzzy_filtered_collapsed_records(&connection, "git", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+
+        assert_eq!(
+            results.first().map(|record| record.command_text.as_str()),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn fuzzy_tui_search_caps_candidates_before_scoring() {
+        let root = temp_root("db-fuzzy-candidate-cap");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for executed_at in 1..=250 {
+            let record = CommandRecord::new(
+                format!("cargo test {executed_at}"),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let candidates =
+            super::fuzzy_candidate_records(&connection, "cargo", &SearchFilters::default(), 10)
+                .expect("fuzzy candidates should load");
+
+        assert!(candidates.len() <= 200);
+    }
+
+    #[test]
+    fn recent_collapsed_search_fills_results_past_duplicates() {
+        let root = temp_root("db-recent-diversity");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for executed_at in 1..=10 {
+            let record = CommandRecord::new(
+                format!("unique command {executed_at}"),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+        for executed_at in 11..=120 {
+            let record = CommandRecord::new(
+                "cargo test".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let recent = recent_collapsed_records(&connection, &SearchFilters::default(), 10)
+            .expect("recent commands should load");
+
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent[0].command_text, "cargo test");
+        assert!(recent
+            .iter()
+            .any(|record| record.command_text == "unique command 10"));
     }
 
     #[test]

@@ -241,6 +241,7 @@ bindkey '^R' seekr-history
 
 unalias sk 2>/dev/null
 sk() {
+  SEEKR_COMMAND=""
   if (( $# )); then
     command seekr "$@"
     return
@@ -251,6 +252,7 @@ sk() {
   action=${reply[1]}
   command_text=${reply[2]}
   if [[ $action == rerun ]]; then
+    _seekr_preexec "$command_text"
     builtin eval -- "$command_text"
   else
     print -rz -- "$command_text"
@@ -1033,6 +1035,105 @@ print -rn -- "$staged"
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), selected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_captures_selected_commands_instead_of_the_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk-capture");
+        let seekr = root.join("seekr");
+        let insert_selection = root.join("insert-selection");
+        let rerun_selection = root.join("rerun-selection");
+        let captures = root.join("captures");
+        let insert_command = "printf '%s\\n' \\\n  'insert marker'";
+        let rerun_command = "printf '%s\\n' \\\n  'rerun marker'\nreturn 7";
+        fs::write(
+            &seekr,
+            r#"#!/bin/sh
+if [ "$1" = capture ]; then
+  shift
+  printf 'CAPTURE\n' >> "$SEEKR_TEST_CAPTURES"
+  printf 'ARG=<%s>\n' "$@" >> "$SEEKR_TEST_CAPTURES"
+  exit 0
+fi
+printf '%s\n' "$SEEKR_TEST_ACTION"
+cat "$SEEKR_TEST_SELECTION"
+"#,
+        )
+        .expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+        fs::write(&insert_selection, insert_command).expect("insert fixture should write");
+        fs::write(&rerun_selection, rerun_command).expect("rerun fixture should write");
+
+        let input = r#"eval "$SEEKR_TEST_HOOK"
+preexec_functions=()
+export SEEKR_TEST_ACTION=insert
+export SEEKR_TEST_SELECTION="$SEEKR_TEST_INSERT_SELECTION"
+_seekr_preexec sk
+sk
+insert_status=$?
+(exit "$insert_status")
+_seekr_precmd
+read -rz staged
+print -r -- "INSERT_STATUS=$insert_status"
+print -r -- "STAGED=$staged"
+export SEEKR_TEST_ACTION=rerun
+export SEEKR_TEST_SELECTION="$SEEKR_TEST_RERUN_SELECTION"
+_seekr_preexec sk
+sk
+rerun_status=$?
+(exit "$rerun_status")
+_seekr_precmd
+print -r -- "RERUN_STATUS=$rerun_status"
+"#;
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let mut child = ProcessCommand::new("zsh")
+            .args(["-f"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_INSERT_SELECTION", &insert_selection)
+            .env("SEEKR_TEST_RERUN_SELECTION", &rerun_selection)
+            .env("SEEKR_TEST_CAPTURES", &captures)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("zsh should start");
+        child
+            .stdin
+            .take()
+            .expect("zsh stdin")
+            .write_all(input.as_bytes())
+            .expect("zsh input should write");
+        let output = child.wait_with_output().expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("INSERT_STATUS=0\nSTAGED={insert_command}\nrerun marker\nRERUN_STATUS=7\n")
+        );
+        let captures = fs::read_to_string(captures).expect("rerun should be captured");
+        assert_eq!(captures.matches("CAPTURE\n").count(), 1);
+        assert!(captures.contains(&format!("ARG=<--command-text>\nARG=<{rerun_command}>\n")));
+        assert!(captures.contains("ARG=<--exit-code>\nARG=<7>\n"));
+        assert!(!captures.contains("ARG=<sk>"));
     }
 
     #[cfg(unix)]
