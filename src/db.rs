@@ -408,6 +408,83 @@ pub fn filtered_collapsed_records(
     Ok(collapse_records(records))
 }
 
+pub fn fuzzy_filtered_collapsed_records(
+    connection: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> io::Result<Vec<CollapsedRecord>> {
+    if !(1..=100).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "limit must be between 1 and 100",
+        ));
+    }
+
+    let query = normalize_command_text(query);
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ponytail: fuzzy matching scans the 100 most recent filtered commands.
+    // Move scoring into SQLite if real histories show this candidate window is too small.
+    let records = filtered_command_records(connection, None, filters, 100)?;
+    let mut scored = collapse_records(records)
+        .into_iter()
+        .filter_map(|record| {
+            fuzzy_score(&query, &record.normalized_text).map(|score| (score, record))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(score, _)| *score);
+    scored.truncate(limit);
+
+    Ok(scored.into_iter().map(|(_, record)| record).collect())
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+    query.split_whitespace().try_fold(0, |total, term| {
+        candidate
+            .split_whitespace()
+            .enumerate()
+            .filter_map(|(position, word)| {
+                fuzzy_term_score(term, word).map(|score| score + position * 25)
+            })
+            .min()
+            .map(|score| total + score)
+    })
+}
+
+fn fuzzy_term_score(term: &str, word: &str) -> Option<usize> {
+    if let Some(position) = word.find(term) {
+        return Some(position * 10 + word.len().saturating_sub(term.len()));
+    }
+
+    let term_len = term.chars().count();
+    if term_len < 3 {
+        return None;
+    }
+
+    let distance = edit_distance(term, word);
+    (distance <= (term_len / 3).max(1)).then_some(100 + distance * 10)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    let mut current = vec![0; previous.len()];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.chars().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_char != right_char));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.chars().count()]
+}
+
 fn collapse_records(records: Vec<CommandRecord>) -> Vec<CollapsedRecord> {
     type CollapseKey = (String, String, Option<String>, Option<String>);
     let mut groups: HashMap<CollapseKey, Vec<CommandRecord>> = HashMap::new();
@@ -482,8 +559,8 @@ fn normalize_command_text(command_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        filtered_command_records, insert_command_record, open, recent_command_records,
-        search_command_records, CommandRecord, SearchFilters,
+        filtered_command_records, fuzzy_filtered_collapsed_records, insert_command_record, open,
+        recent_command_records, search_command_records, CommandRecord, SearchFilters,
     };
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
@@ -657,6 +734,59 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].executed_at, 1_720_000_001);
         assert_eq!(records[1].executed_at, 1_720_000_000);
+    }
+
+    #[test]
+    fn fuzzy_tui_search_matches_partial_and_transposed_queries() {
+        let root = temp_root("db-fuzzy-search");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        for (command_text, executed_at) in [
+            ("cargo docker", 4),
+            ("cargo test", 3),
+            ("docker compose up", 2),
+            ("docker ps", 1),
+        ] {
+            let record = CommandRecord::new(
+                command_text.to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &record).expect("record should insert");
+        }
+
+        let first_character =
+            fuzzy_filtered_collapsed_records(&connection, "d", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+        assert_eq!(
+            first_character
+                .iter()
+                .map(|record| record.command_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docker compose up", "docker ps", "cargo docker"]
+        );
+
+        let typo =
+            fuzzy_filtered_collapsed_records(&connection, "dokcer", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+        assert_eq!(
+            typo.first().map(|record| record.command_text.as_str()),
+            Some("docker compose up")
+        );
+
+        assert!(
+            search_command_records(&connection, "dokcer", 10)
+                .expect("CLI search should succeed")
+                .is_empty(),
+            "CLI FTS behavior should remain exact"
+        );
     }
 
     #[test]

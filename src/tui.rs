@@ -58,6 +58,12 @@ impl App {
             (KeyCode::Char('r'), KeyModifiers::ALT) => {
                 selected().map_or(Action::Continue, Action::Rerun)
             }
+            (KeyCode::Char('y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                selected().map_or(Action::Continue, Action::Copy)
+            }
+            (KeyCode::Char('e'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                selected().map_or(Action::Continue, Action::Rerun)
+            }
             (KeyCode::Up, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 Action::Continue
@@ -115,9 +121,9 @@ fn run_loop(
             if app.input.is_empty() {
                 app.set_results(Vec::new());
             } else {
-                match db::filtered_collapsed_records(
+                match db::fuzzy_filtered_collapsed_records(
                     connection,
-                    Some(&app.input),
+                    &app.input,
                     &db::SearchFilters::default(),
                     RESULT_LIMIT,
                 ) {
@@ -333,7 +339,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Green),
         )]),
         Line::from(vec![Span::styled(meta, Style::default().fg(Color::Gray))]),
-        Line::from("[Enter] Insert/edit  [Alt+C] Copy  [Alt+R] Rerun (executes)"),
+        Line::from("[Enter] Insert/edit  [Ctrl+Y] Copy  [Ctrl+E] Rerun (executes)"),
         Line::from(app.status.as_deref().unwrap_or("")),
     ];
 
@@ -541,6 +547,21 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
             Action::Rerun("cargo   test -- --exact".into())
+        );
+    }
+
+    #[test]
+    fn control_shortcuts_work_without_alt_encoding() {
+        let mut app = App::default();
+        app.set_results(vec![record("cargo test")]);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            Action::Copy("cargo test".into())
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Action::Rerun("cargo test".into())
         );
     }
 

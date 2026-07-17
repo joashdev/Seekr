@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CLI_ABOUT: &str =
     "Seekr is a local-first CLI and future TUI for recalling terminal commands.";
 const CLI_AFTER_HELP: &str =
-    "Planned alias: sk\n\nRunning `seekr` with no subcommand is reserved for the future TUI.";
+    "The generated zsh integration installs `sk` and Ctrl-R command recall.";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -184,12 +184,21 @@ typeset -g SEEKR_HOSTNAME=""
 typeset -g SEEKR_GIT_REPO=""
 typeset -g SEEKR_GIT_BRANCH=""
 
-_seekr_widget() {
+_seekr_select() {
   local result action command_text
   result=$(command seekr) || return
   [[ $result == *$'\n'* ]] || return
   action=${result%%$'\n'*}
   command_text=${result#*$'\n'}
+  reply=("$action" "$command_text")
+}
+
+_seekr_widget() {
+  local -a reply
+  local action command_text
+  _seekr_select || return
+  action=${reply[1]}
+  command_text=${reply[2]}
   BUFFER=$command_text
   CURSOR=${#BUFFER}
   [[ $action == rerun ]] && zle accept-line
@@ -197,6 +206,20 @@ _seekr_widget() {
 
 zle -N seekr-history _seekr_widget
 bindkey '^R' seekr-history
+
+unalias sk 2>/dev/null
+sk() {
+  local -a reply
+  local action command_text
+  _seekr_select || return
+  action=${reply[1]}
+  command_text=${reply[2]}
+  if [[ $action == rerun ]]; then
+    builtin eval -- "$command_text"
+  else
+    print -rz -- "$command_text"
+  fi
+}
 
 _seekr_preexec() {
   SEEKR_COMMAND=$1
@@ -846,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn includes_planned_alias_in_help() {
+    fn includes_zsh_integration_in_help() {
         let mut command = Cli::command();
         let mut help = Vec::new();
 
@@ -856,7 +879,7 @@ mod tests {
 
         let help = String::from_utf8(help).expect("help should be utf8");
 
-        assert!(help.contains("Planned alias: sk"));
+        assert!(help.contains("generated zsh integration"));
         assert!(help.contains("search"));
         assert!(help.contains("here"));
         assert!(help.contains("failed"));
@@ -883,11 +906,73 @@ mod tests {
         assert!(output.contains("SEEKR_CWD=$PWD"));
         assert!(output.contains("EPOCHREALTIME * 1000"));
         assert!(output.contains("bindkey '^R' seekr-history"));
+        assert!(output.contains("sk()"));
+        assert!(output.contains("print -rz -- \"$command_text\""));
         assert!(output.contains("BUFFER=$command_text"));
         assert!(output.contains("[[ $action == rerun ]] && zle accept-line"));
         assert_capture_fields(&output, "zsh");
         assert!(output.contains("~/.zshrc"));
         assert_shell_syntax("zsh", &output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_sk_stages_raw_multiline_commands_without_printing_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = dispatch(Cli {
+            command: Some(Command::Init(InitArgs {
+                shell: HookShell::Zsh,
+            })),
+        })
+        .expect("zsh hook should render");
+        let root = temp_root("zsh-sk");
+        let seekr = root.join("seekr");
+        let selection = root.join("selection");
+        let selected = "printf '%s\\n' \\\n  'hello world'";
+        fs::write(
+            &seekr,
+            "#!/bin/sh\nprintf 'insert\\n'\ncat \"$SEEKR_TEST_SELECTION\"\n",
+        )
+        .expect("seekr stub should write");
+        fs::set_permissions(&seekr, fs::Permissions::from_mode(0o755))
+            .expect("seekr stub should be executable");
+        fs::write(&selection, selected).expect("selection fixture should write");
+
+        let input = r#"eval "$SEEKR_TEST_HOOK"
+sk
+read -rz staged
+print -rn -- "$staged"
+"#;
+        let path = format!(
+            "{}:{}",
+            root.display(),
+            env::var("PATH").expect("PATH should be set")
+        );
+        let mut child = ProcessCommand::new("zsh")
+            .args(["-f"])
+            .env("PATH", path)
+            .env("SEEKR_TEST_HOOK", hook)
+            .env("SEEKR_TEST_SELECTION", &selection)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("zsh should start");
+        child
+            .stdin
+            .take()
+            .expect("zsh stdin")
+            .write_all(input.as_bytes())
+            .expect("zsh input should write");
+        let output = child.wait_with_output().expect("zsh should finish");
+
+        assert!(
+            output.status.success(),
+            "zsh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), selected);
     }
 
     #[test]

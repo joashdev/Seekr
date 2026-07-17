@@ -14,21 +14,25 @@ mkdir -p "$HOME/.local/bin"
 cp target/release/seekr "$HOME/.local/bin/seekr"
 ```
 
-`sk` is the intended short alias. Add the alias and generated hook for your shell to its startup file:
+Add the generated hook for your shell to its startup file:
 
 ```bash
 # zsh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-echo 'alias sk=seekr' >> ~/.zshrc
 "$HOME/.local/bin/seekr" init zsh >> ~/.zshrc
 source ~/.zshrc
 
 # bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-echo 'alias sk=seekr' >> ~/.bashrc
 "$HOME/.local/bin/seekr" init bash >> ~/.bashrc
 source ~/.bashrc
 ```
+
+The zsh hook installs both `Ctrl-R` and an `sk` function. `sk` consumes Seekr's
+selection protocol and puts an inserted command onto zsh's editable command
+line. Do not replace it with `alias sk=seekr`, which cannot stage the selected
+command in the parent shell. The bash hook currently exposes recall through
+`Ctrl-R`.
 
 Import existing zsh history, search from the CLI, or launch the TUI:
 
@@ -95,9 +99,9 @@ The script creates temporary config and data directories and removes them when i
 For the interactive behavior, use safe commands and check:
 
 1. Launch `sk`; type a known query and verify the result list and preview update.
-2. Press `Alt+C` and verify the raw selected command reaches the clipboard without leaving the TUI.
+2. Press `Ctrl+Y` and verify the raw selected command reaches the clipboard without leaving the TUI.
 3. Press `Enter` and verify the command is inserted/staged at the prompt and remains editable rather than executing.
-4. Press `Alt+R` and verify the visibly labeled explicit rerun action executes the selected safe command.
+4. Press `Ctrl+E` and verify the visibly labeled explicit rerun action executes the selected safe command.
 
 ## Releasing
 
