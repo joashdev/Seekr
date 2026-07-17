@@ -113,8 +113,8 @@ CI runs formatting, Clippy, tests, and the smoke script on pushes and pull reque
 Only a repository administrator can create a release tag. To release, update the version in `Cargo.toml`, merge it to `main`, then push the matching tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The release workflow builds a Linux x86_64 archive, waits for approval from the protected `release` environment, and publishes the archive with signed SLSA provenance. Published releases and their tags are immutable.
@@ -122,8 +122,8 @@ The release workflow builds a Linux x86_64 archive, waits for approval from the 
 Verify a downloaded release and its assets with the GitHub CLI:
 
 ```bash
-gh release verify v0.1.0 --repo joashdev/Seekr
-gh release verify-asset v0.1.0 seekr-v0.1.0-x86_64-unknown-linux-gnu.tar.gz --repo joashdev/Seekr
+gh release verify v0.1.1 --repo joashdev/Seekr
+gh release verify-asset v0.1.1 seekr-v0.1.1-x86_64-unknown-linux-gnu.tar.gz --repo joashdev/Seekr
 ```
 
 ## License
