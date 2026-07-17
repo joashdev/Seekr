@@ -24,23 +24,26 @@ source ~/.zshrc
 
 # bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+echo 'alias sk=seekr' >> ~/.bashrc
 "$HOME/.local/bin/seekr" init bash >> ~/.bashrc
 source ~/.bashrc
 ```
 
 The zsh hook installs both `Ctrl-R` and an `sk` function. `sk` consumes Seekr's
 selection protocol and puts an inserted command onto zsh's editable command
-line. Do not replace it with `alias sk=seekr`, which cannot stage the selected
-command in the parent shell. The bash hook currently exposes recall through
-`Ctrl-R`.
+line. Do not replace that function with an alias. Under bash, the `sk` alias is
+a shorthand for CLI subcommands such as `sk search`; launch interactive recall
+with `Ctrl-R`, which can stage the selection in bash's editable command line.
 
-Import existing zsh history, search from the CLI, or launch the TUI:
+Import existing zsh history or search from the CLI:
 
 ```bash
 seekr import ~/.zsh_history
 seekr search docker
-sk
 ```
+
+On zsh, run `sk` to launch interactive recall. On bash, press `Ctrl-R` at the
+editable prompt; the `sk` alias is for CLI subcommands.
 
 The shell hook captures future commands locally. Privacy redaction is off by default so stored commands remain runnable. To opt in, create the config file shown by your platform's Seekr config directory with:
 
@@ -101,7 +104,7 @@ For the interactive behavior, use safe commands and check:
 1. Launch `sk`; type a known query and verify the result list and preview update.
 2. Press `Ctrl+Y` and verify the raw selected command reaches the clipboard without leaving the TUI.
 3. Press `Enter` and verify the command is inserted/staged at the prompt and remains editable rather than executing.
-4. Press `Ctrl+E` and verify the visibly labeled explicit rerun action executes the selected safe command.
+4. Press `F5` and verify the visibly labeled explicit rerun action executes the selected safe command.
 
 ## Releasing
 

@@ -52,18 +52,10 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Action::Quit,
             (KeyCode::Enter, _) => selected().map_or(Action::Continue, Action::Insert),
-            (KeyCode::Char('c'), KeyModifiers::ALT) => {
-                selected().map_or(Action::Continue, Action::Copy)
-            }
-            (KeyCode::Char('r'), KeyModifiers::ALT) => {
-                selected().map_or(Action::Continue, Action::Rerun)
-            }
             (KeyCode::Char('y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 selected().map_or(Action::Continue, Action::Copy)
             }
-            (KeyCode::Char('e'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                selected().map_or(Action::Continue, Action::Rerun)
-            }
+            (KeyCode::F(5), _) => selected().map_or(Action::Continue, Action::Rerun),
             (KeyCode::Up, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 Action::Continue
@@ -339,7 +331,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Green),
         )]),
         Line::from(vec![Span::styled(meta, Style::default().fg(Color::Gray))]),
-        Line::from("[Enter] Insert/edit  [Ctrl+Y] Copy  [Ctrl+E] Rerun (executes)"),
+        Line::from("[Enter] Insert/edit  [Ctrl+Y] Copy  [F5] Rerun (executes)"),
         Line::from(app.status.as_deref().unwrap_or("")),
     ];
 
@@ -541,17 +533,17 @@ mod tests {
         app.set_results(vec![record("cargo   test -- --exact")]);
 
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)),
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
             Action::Copy("cargo   test -- --exact".into())
         );
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Action::Rerun("cargo   test -- --exact".into())
         );
     }
 
     #[test]
-    fn control_shortcuts_work_without_alt_encoding() {
+    fn terminal_portable_shortcuts_avoid_line_editing_collisions() {
         let mut app = App::default();
         app.set_results(vec![record("cargo test")]);
 
@@ -560,8 +552,12 @@ mod tests {
             Action::Copy("cargo test".into())
         );
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Action::Rerun("cargo test".into())
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Action::Continue
         );
     }
 

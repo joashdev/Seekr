@@ -273,15 +273,28 @@ pub fn filtered_command_records(
     filters: &SearchFilters,
     limit: usize,
 ) -> io::Result<Vec<CommandRecord>> {
-    let limit = i64::try_from(limit)
-        .ok()
-        .filter(|limit| (1..=100).contains(limit))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "limit must be between 1 and 100",
-            )
-        })?;
+    filtered_command_records_with_limit(connection, query, filters, Some(limit))
+}
+
+fn filtered_command_records_with_limit(
+    connection: &Connection,
+    query: Option<&str>,
+    filters: &SearchFilters,
+    limit: Option<usize>,
+) -> io::Result<Vec<CommandRecord>> {
+    let limit = limit
+        .map(|limit| {
+            i64::try_from(limit)
+                .ok()
+                .filter(|limit| (1..=100).contains(limit))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "limit must be between 1 and 100",
+                    )
+                })
+        })
+        .transpose()?;
     if filters.since.is_some_and(|since| since < 0)
         || filters.before.is_some_and(|before| before < 0)
         || matches!((filters.since, filters.before), (Some(since), Some(before)) if since > before)
@@ -364,11 +377,14 @@ pub fn filtered_command_records(
         sql.push_str(&clauses.join(" AND "));
     }
     sql.push_str(if has_query {
-        " ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC LIMIT ?"
+        " ORDER BY bm25(commands_fts), commands.executed_at DESC, commands.id DESC"
     } else {
-        " ORDER BY commands.executed_at DESC, commands.id DESC LIMIT ?"
+        " ORDER BY commands.executed_at DESC, commands.id DESC"
     });
-    values.push(Value::Integer(limit));
+    if let Some(limit) = limit {
+        sql.push_str(" LIMIT ?");
+        values.push(Value::Integer(limit));
+    }
 
     let mut statement = connection.prepare(&sql).map_err(io::Error::other)?;
     let rows = statement
@@ -426,9 +442,7 @@ pub fn fuzzy_filtered_collapsed_records(
         return Ok(Vec::new());
     }
 
-    // ponytail: fuzzy matching scans the 100 most recent filtered commands.
-    // Move scoring into SQLite if real histories show this candidate window is too small.
-    let records = filtered_command_records(connection, None, filters, 100)?;
+    let records = filtered_command_records_with_limit(connection, None, filters, None)?;
     let mut scored = collapse_records(records)
         .into_iter()
         .filter_map(|record| {
@@ -460,12 +474,35 @@ fn fuzzy_term_score(term: &str, word: &str) -> Option<usize> {
     }
 
     let term_len = term.chars().count();
-    if term_len < 3 {
+    if term_len < 2 {
         return None;
+    }
+
+    if let Some(score) = subsequence_score(term, word) {
+        return Some(score);
     }
 
     let distance = edit_distance(term, word);
     (distance <= (term_len / 3).max(1)).then_some(100 + distance * 10)
+}
+
+fn subsequence_score(term: &str, word: &str) -> Option<usize> {
+    let mut word_chars = word.chars().enumerate();
+    let mut first = None;
+    let mut last = 0;
+
+    for term_char in term.chars() {
+        let (position, _) = word_chars.find(|(_, word_char)| *word_char == term_char)?;
+        first.get_or_insert(position);
+        last = position;
+    }
+
+    let first = first?;
+    Some(
+        50 + first * 10
+            + (last - first + 1).saturating_sub(term.chars().count())
+            + word.chars().count().saturating_sub(last + 1),
+    )
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -781,11 +818,73 @@ mod tests {
             Some("docker compose up")
         );
 
+        let abbreviation =
+            fuzzy_filtered_collapsed_records(&connection, "dk", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+        assert_eq!(
+            abbreviation
+                .first()
+                .map(|record| record.command_text.as_str()),
+            Some("docker compose up")
+        );
+
+        assert!(
+            fuzzy_filtered_collapsed_records(&connection, "x", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed")
+                .is_empty(),
+            "one-character non-substring queries should not create noisy matches"
+        );
+
         assert!(
             search_command_records(&connection, "dokcer", 10)
                 .expect("CLI search should succeed")
                 .is_empty(),
             "CLI FTS behavior should remain exact"
+        );
+    }
+
+    #[test]
+    fn fuzzy_tui_search_scans_beyond_recent_duplicate_history() {
+        let root = temp_root("db-fuzzy-full-history");
+        let connection = open(&root.join("seekr.db")).expect("database should initialize");
+
+        let old_match = CommandRecord::new(
+            "docker compose up".to_string(),
+            "/tmp/project".to_string(),
+            1,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("record should validate");
+        insert_command_record(&connection, &old_match).expect("record should insert");
+
+        for executed_at in 2..=102 {
+            let duplicate = CommandRecord::new(
+                "cargo test".to_string(),
+                "/tmp/project".to_string(),
+                executed_at,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("record should validate");
+            insert_command_record(&connection, &duplicate).expect("record should insert");
+        }
+
+        let results =
+            fuzzy_filtered_collapsed_records(&connection, "docker", &SearchFilters::default(), 10)
+                .expect("fuzzy search should succeed");
+
+        assert_eq!(
+            results.first().map(|record| record.command_text.as_str()),
+            Some("docker compose up")
         );
     }
 
